@@ -1,6 +1,180 @@
 #Requires -Version 7.0
 
 $script:AskPassPath = Join-Path $PSScriptRoot 'ssh-askpass.cmd'
+$script:OriginalSshEnv = $null
+
+#region Private Functions
+
+function Set-SshAskpassEnvironment {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential
+    )
+
+    # Store original values for restoration
+    $script:OriginalSshEnv = @{
+        SSH_ASKPASS             = $env:SSH_ASKPASS
+        DISPLAY                 = $env:DISPLAY
+        SSH_CREDENTIAL_PASSWORD = $env:SSH_CREDENTIAL_PASSWORD
+        SSH_ASKPASS_REQUIRE     = $env:SSH_ASKPASS_REQUIRE
+    }
+
+    $env:SSH_ASKPASS = $script:AskPassPath
+    $env:DISPLAY = 'required_for_askpass'
+    $env:SSH_CREDENTIAL_PASSWORD = $Credential.GetNetworkCredential().Password
+    $env:SSH_ASKPASS_REQUIRE = 'force'
+}
+
+function Remove-SshAskpassEnvironment {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:OriginalSshEnv) {
+        return
+    }
+
+    foreach ($var in $script:OriginalSshEnv.Keys) {
+        if ($null -eq $script:OriginalSshEnv[$var]) {
+            Remove-Item "Env:$var" -ErrorAction SilentlyContinue
+        }
+        else {
+            Set-Item "Env:$var" -Value $script:OriginalSshEnv[$var]
+        }
+    }
+
+    $script:OriginalSshEnv = $null
+}
+
+#endregion Private Functions
+
+#region Public Functions
+
+function Test-SshConnection {
+    <#
+    .SYNOPSIS
+        Tests SSH connectivity to a remote host with timeout protection.
+    
+    .DESCRIPTION
+        Performs a quick SSH connection test by executing a simple PowerShell command
+        on the remote host. Uses a background job with timeout to prevent hanging
+        on unreachable hosts. Tests the full connection path including any ProxyJump
+        configurations in your SSH config.
+    
+    .PARAMETER ComputerName
+        The hostname or IP address to test. This should match a host entry in your
+        SSH config if using bastion/ProxyJump configurations.
+    
+    .PARAMETER Credential
+        Optional PSCredential object for password-based authentication.
+    
+    .PARAMETER UserName
+        Optional username for key-based authentication.
+    
+    .PARAMETER TimeoutSeconds
+        Maximum seconds to wait for connection. Defaults to 30.
+    
+    .PARAMETER Port
+        SSH port. Defaults to 22.
+    
+    .EXAMPLE
+        Test-SshConnection -ComputerName server01
+        # Returns $true if connection succeeds
+    
+    .EXAMPLE
+        if (Test-SshConnection -ComputerName server01 -TimeoutSeconds 10) {
+            $session = New-SshSession -ComputerName server01
+        }
+    
+    .EXAMPLE
+        Test-SshConnection -ComputerName customer-server -Credential $cred
+        # Tests connection with password authentication through any configured bastion hops
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [string]$ComputerName,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter()]
+        [string]$UserName,
+
+        [Parameter()]
+        [int]$TimeoutSeconds = 30,
+
+        [Parameter()]
+        [int]$Port = 22
+    )
+
+    # Determine username for SSH target
+    $effectiveUserName = if ($Credential) { $Credential.UserName } elseif ($UserName) { $UserName } else { $null }
+    $sshTarget = if ($effectiveUserName) { "$effectiveUserName@$ComputerName" } else { $ComputerName }
+
+    # Simple test command - returns 'OK!' if PowerShell runs successfully
+    $testScript = "Return 'OK!'"
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($testScript)
+    $encodedCommand = [Convert]::ToBase64String($bytes)
+
+    # Build SSH command with strict host key checking disabled for automation
+    # When using credentials, force password auth only to prevent key fallback
+    $sshOptions = "-o StrictHostKeyChecking=no -o ConnectTimeout=$TimeoutSeconds"
+    if ($Credential) {
+        $sshOptions += " -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+    }
+    
+    $sshCommand = "ssh $sshOptions -p $Port $sshTarget 'pwsh -e $encodedCommand'"
+    $scriptBlock = [scriptblock]::Create($sshCommand)
+
+    Write-Verbose "Testing SSH connection: $sshCommand"
+
+    $job = $null
+    try {
+        if ($Credential) {
+            Set-SshAskpassEnvironment -Credential $Credential
+        }
+
+        $job = Start-Job -ScriptBlock $scriptBlock
+        $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+
+        if (-not $completed) {
+            Write-Verbose "SSH connection to '$ComputerName' timed out after $TimeoutSeconds seconds."
+            return $false
+        }
+
+        if ($job.State -eq 'Failed') {
+            $errorInfo = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            Write-Verbose "SSH connection to '$ComputerName' failed: $errorInfo"
+            return $false
+        }
+
+        $result = Receive-Job -Job $job
+
+        if ($result -eq 'OK!') {
+            Write-Verbose "SSH connection test successful."
+            return $true
+        }
+        else {
+            Write-Verbose "SSH connection to '$ComputerName' failed. Unexpected response: $result"
+            return $false
+        }
+    }
+    catch {
+        Write-Verbose "SSH connection to '$ComputerName' failed: $_"
+        return $false
+    }
+    finally {
+        if ($Credential) {
+            Remove-SshAskpassEnvironment
+        }
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 function New-SshSession {
     <#
@@ -11,6 +185,9 @@ function New-SshSession {
         Wraps New-PSSession for SSH connections, adding support for PSCredential objects
         by configuring SSH_ASKPASS automatically. Returns a standard PSSession that works
         with all native PowerShell remoting cmdlets.
+        
+        By default, tests connectivity before creating the session to avoid hanging on
+        unreachable hosts. Use -SkipTest to bypass this check.
     
     .PARAMETER ComputerName
         The hostname or IP address of the remote computer.
@@ -27,6 +204,13 @@ function New-SshSession {
     .PARAMETER Options
         Additional SSH options as a hashtable, passed to New-PSSession -Options.
     
+    .PARAMETER SkipTest
+        Skip the connectivity test before creating the session. Use when you're confident
+        the host is reachable or when the test overhead is undesirable.
+    
+    .PARAMETER TestTimeoutSeconds
+        Timeout for the connectivity test. Defaults to 30 seconds. Ignored if -SkipTest is specified.
+    
     .EXAMPLE
         $session = New-SshSession -ComputerName server01 -Credential (Get-Credential)
         Invoke-Command -Session $session -ScriptBlock { Get-Process }
@@ -34,6 +218,10 @@ function New-SshSession {
     .EXAMPLE
         $session = New-SshSession -ComputerName server01 -UserName admin
         # Uses SSH key authentication for 'admin' user
+    
+    .EXAMPLE
+        $session = New-SshSession -ComputerName server01 -SkipTest
+        # Skips connectivity test for faster session creation
     #>
     [CmdletBinding()]
     [OutputType([System.Management.Automation.Runspaces.PSSession])]
@@ -51,8 +239,34 @@ function New-SshSession {
         [int]$Port = 22,
 
         [Parameter()]
-        [hashtable]$Options
+        [hashtable]$Options,
+
+        [Parameter()]
+        [switch]$SkipTest,
+
+        [Parameter()]
+        [int]$TestTimeoutSeconds = 30
     )
+
+    # Test connectivity first unless skipped
+    if (-not $SkipTest) {
+        $testParams = @{
+            ComputerName   = $ComputerName
+            Port           = $Port
+            TimeoutSeconds = $TestTimeoutSeconds
+        }
+
+        if ($Credential) {
+            $testParams['Credential'] = $Credential
+        }
+        elseif ($UserName) {
+            $testParams['UserName'] = $UserName
+        }
+
+        if (-not (Test-SshConnection @testParams)) {
+            throw "SSH connection test to '$ComputerName' failed. Use -Verbose for details or -SkipTest to bypass."
+        }
+    }
 
     $sessionParams = @{
         HostName = $ComputerName
@@ -66,32 +280,30 @@ function New-SshSession {
     if ($Credential) {
         $sessionParams['UserName'] = $Credential.UserName
         
-        $originalAskPass = $env:SSH_ASKPASS
-        $originalDisplay = $env:DISPLAY
-        $originalPassword = $env:SSH_CREDENTIAL_PASSWORD
-        $originalAskPassRequire = $env:SSH_ASKPASS_REQUIRE
+        # Force password-only auth to prevent key fallback
+        $sshOptions = @{
+            PreferredAuthentications = 'password'
+            PubkeyAuthentication     = 'no'
+        }
+        
+        # Merge with any user-provided options (user options take precedence)
+        if ($sessionParams['Options']) {
+            foreach ($key in $sshOptions.Keys) {
+                if (-not $sessionParams['Options'].ContainsKey($key)) {
+                    $sessionParams['Options'][$key] = $sshOptions[$key]
+                }
+            }
+        }
+        else {
+            $sessionParams['Options'] = $sshOptions
+        }
 
         try {
-            $env:SSH_ASKPASS = $script:AskPassPath
-            $env:DISPLAY = 'required_for_askpass'
-            $env:SSH_CREDENTIAL_PASSWORD = $Credential.GetNetworkCredential().Password
-            $env:SSH_ASKPASS_REQUIRE = 'force'
-
+            Set-SshAskpassEnvironment -Credential $Credential
             New-PSSession @sessionParams
         }
         finally {
-            # Restore original environment
-            if ($null -eq $originalAskPass) { Remove-Item Env:SSH_ASKPASS -ErrorAction SilentlyContinue }
-            else { $env:SSH_ASKPASS = $originalAskPass }
-
-            if ($null -eq $originalDisplay) { Remove-Item Env:DISPLAY -ErrorAction SilentlyContinue }
-            else { $env:DISPLAY = $originalDisplay }
-
-            if ($null -eq $originalPassword) { Remove-Item Env:SSH_CREDENTIAL_PASSWORD -ErrorAction SilentlyContinue }
-            else { $env:SSH_CREDENTIAL_PASSWORD = $originalPassword }
-
-            if ($null -eq $originalAskPassRequire) { Remove-Item Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue }
-            else { $env:SSH_ASKPASS_REQUIRE = $originalAskPassRequire }
+            Remove-SshAskpassEnvironment
         }
     }
     else {
@@ -133,6 +345,12 @@ function Invoke-SshCommand {
     .PARAMETER Port
         SSH port. Defaults to 22.
     
+    .PARAMETER SkipTest
+        Skip the connectivity test before creating the session.
+    
+    .PARAMETER TestTimeoutSeconds
+        Timeout for the connectivity test. Defaults to 30 seconds. Ignored if -SkipTest is specified.
+    
     .EXAMPLE
         Invoke-SshCommand -ComputerName server01 -Credential $cred -ScriptBlock { Get-Service W32Time }
     
@@ -161,7 +379,13 @@ function Invoke-SshCommand {
         [string]$UserName,
 
         [Parameter(ParameterSetName = 'ComputerName')]
-        [int]$Port = 22
+        [int]$Port = 22,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [switch]$SkipTest,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [int]$TestTimeoutSeconds = 30
     )
 
     $invokeParams = @{
@@ -180,8 +404,10 @@ function Invoke-SshCommand {
         }
         else {
             $sessionParams = @{
-                ComputerName = $ComputerName
-                Port         = $Port
+                ComputerName       = $ComputerName
+                Port               = $Port
+                SkipTest           = $SkipTest
+                TestTimeoutSeconds = $TestTimeoutSeconds
             }
 
             if ($Credential) {
@@ -240,6 +466,12 @@ function Send-SshFile {
     .PARAMETER Force
         Overwrite existing files.
     
+    .PARAMETER SkipTest
+        Skip the connectivity test before creating the session.
+    
+    .PARAMETER TestTimeoutSeconds
+        Timeout for the connectivity test. Defaults to 30 seconds. Ignored if -SkipTest is specified.
+    
     .EXAMPLE
         Send-SshFile -Path .\config.json -Destination /etc/myapp/ -ComputerName server01 -Credential $cred
     
@@ -274,7 +506,13 @@ function Send-SshFile {
         [switch]$Recurse,
 
         [Parameter()]
-        [switch]$Force
+        [switch]$Force,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [switch]$SkipTest,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [int]$TestTimeoutSeconds = 30
     )
 
     $copyParams = @{
@@ -293,8 +531,10 @@ function Send-SshFile {
         }
         else {
             $sessionParams = @{
-                ComputerName = $ComputerName
-                Port         = $Port
+                ComputerName       = $ComputerName
+                Port               = $Port
+                SkipTest           = $SkipTest
+                TestTimeoutSeconds = $TestTimeoutSeconds
             }
 
             if ($Credential) {
@@ -353,6 +593,12 @@ function Receive-SshFile {
     .PARAMETER Force
         Overwrite existing files.
     
+    .PARAMETER SkipTest
+        Skip the connectivity test before creating the session.
+    
+    .PARAMETER TestTimeoutSeconds
+        Timeout for the connectivity test. Defaults to 30 seconds. Ignored if -SkipTest is specified.
+    
     .EXAMPLE
         Receive-SshFile -Path /var/log/myapp.log -Destination .\logs\ -ComputerName server01 -Credential $cred
     
@@ -387,7 +633,13 @@ function Receive-SshFile {
         [switch]$Recurse,
 
         [Parameter()]
-        [switch]$Force
+        [switch]$Force,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [switch]$SkipTest,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [int]$TestTimeoutSeconds = 30
     )
 
     $copyParams = @{
@@ -406,8 +658,10 @@ function Receive-SshFile {
         }
         else {
             $sessionParams = @{
-                ComputerName = $ComputerName
-                Port         = $Port
+                ComputerName       = $ComputerName
+                Port               = $Port
+                SkipTest           = $SkipTest
+                TestTimeoutSeconds = $TestTimeoutSeconds
             }
 
             if ($Credential) {
@@ -430,4 +684,6 @@ function Receive-SshFile {
     }
 }
 
-Export-ModuleMember -Function New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile
+#endregion Public Functions
+
+Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile

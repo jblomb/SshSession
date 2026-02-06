@@ -5,6 +5,7 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 ## Features
 
 - **Simplified Credential Management**: Use `PSCredential` objects directly for password-based authentication, just like with WinRM-based remoting.
+- **Connection Testing with Timeout**: Automatically tests connectivity before creating sessions to avoid hanging on unreachable hosts.
 - **Persistent and Ephemeral Sessions**: Create and manage persistent `PSSession` objects or use one-liner commands for quick, ephemeral operations.
 - **Familiar Syntax**: Works like native PowerShell Remoting (`*-PSSession`, `Invoke-Command`, `Copy-Item`).
 - **File Transfer Support**: Easily send and receive files and directories to and from remote systems over SSH.
@@ -30,9 +31,29 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 
 ## Usage
 
+### `Test-SshConnection`
+
+Tests SSH connectivity to a remote host with timeout protection. Returns `$true` if the connection succeeds, `$false` otherwise. Use `-Verbose` to see detailed failure information.
+
+**Example 1: Test connectivity before running commands**
+
+```powershell
+if (Test-SshConnection -ComputerName 'server.example.com' -Credential $cred) {
+    # Proceed with operations
+}
+```
+
+**Example 2: Test with a shorter timeout**
+
+```powershell
+Test-SshConnection -ComputerName 'server.example.com' -TimeoutSeconds 10 -Verbose
+```
+
 ### `New-SshSession`
 
 Creates a new persistent `PSSession` over SSH. This is ideal when you need to run multiple commands or transfer multiple files.
+
+By default, `New-SshSession` tests connectivity before creating the session to avoid hanging on unreachable hosts. Use `-SkipTest` to bypass this check.
 
 **Example 1: Create a session using a credential**
 
@@ -48,6 +69,18 @@ If you have SSH key-based authentication configured, you can omit the `-Credenti
 
 ```powershell
 $session = New-SshSession -ComputerName 'server.example.com' -UserName 'admin'
+```
+
+**Example 3: Skip the connectivity test**
+
+```powershell
+$session = New-SshSession -ComputerName 'server.example.com' -Credential $cred -SkipTest
+```
+
+**Example 4: Use a custom timeout for the connectivity test**
+
+```powershell
+$session = New-SshSession -ComputerName 'server.example.com' -Credential $cred -TestTimeoutSeconds 10
 ```
 
 ### `Invoke-SshCommand`
@@ -106,6 +139,15 @@ Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -ComputerName 's
 Receive-SshFile -Path '/etc/myapp' -Destination '.\backup' -Session $session -Recurse
 ```
 
+## Common Parameters
+
+The following parameters are available on `New-SshSession`, `Invoke-SshCommand`, `Send-SshFile`, and `Receive-SshFile` when creating ephemeral sessions:
+
+| Parameter | Description |
+|-----------|-------------|
+| `-SkipTest` | Skip the connectivity test before creating the session. Use when you're confident the host is reachable or when the test overhead is undesirable. |
+| `-TestTimeoutSeconds` | Timeout for the connectivity test in seconds. Defaults to 30. Ignored if `-SkipTest` is specified. |
+
 ## Credential Handling
 
 This module simplifies password-based authentication with SSH by leveraging the `SSH_ASKPASS` environment variable. When you provide a `PSCredential` object, the module securely does the following:
@@ -116,3 +158,5 @@ This module simplifies password-based authentication with SSH by leveraging the 
 4.  The temporary environment variables are automatically cleaned up after the session is created.
 
 This allows `New-PSSession` to authenticate with a password without requiring interactive input, making it suitable for automation and scripting. Key-based authentication remains the default if no credential is provided.
+
+When credentials are provided, the module forces password-only authentication (`PreferredAuthentications=password`, `PubkeyAuthentication=no`) to prevent SSH from falling back to key-based authentication if the password is incorrect.
