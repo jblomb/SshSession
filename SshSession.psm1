@@ -46,6 +46,32 @@ function Remove-SshAskpassEnvironment {
     $script:OriginalSshEnv = $null
 }
 
+function Get-SshSessionInfo {
+    <# Extracts ComputerName, UserName, and Port from an existing PSSession. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Runspaces.PSSession]$Session
+    )
+
+    $computerName = $Session.ComputerName
+    $userName = $Session.Runspace.ConnectionInfo.UserName
+
+    try {
+        $sessionPort = $Session.Runspace.ConnectionInfo.Port
+        $port = if ($sessionPort -and $sessionPort -gt 0) { $sessionPort } else { 22 }
+    }
+    catch {
+        $port = 22
+    }
+
+    return @{
+        ComputerName = $computerName
+        UserName     = $userName
+        Port         = $port
+    }
+}
+
 #endregion Private Functions
 
 #region Public Functions
@@ -153,7 +179,7 @@ function Test-SshConnection {
         $result = Receive-Job -Job $job
 
         if ($result -eq 'OK!') {
-            Write-Verbose "SSH connection test successful."
+            Write-Verbose "SSH connection to '$ComputerName' succeeded."
             return $true
         }
         else {
@@ -188,9 +214,18 @@ function New-SshSession {
         
         By default, tests connectivity before creating the session to avoid hanging on
         unreachable hosts. Use -SkipTest to bypass this check.
+        
+        Can also accept an existing PSSession via -Session to create a fresh replacement
+        session using the same connection details. This is useful for repairing broken or
+        disconnected sessions. The old session is removed automatically.
     
     .PARAMETER ComputerName
         The hostname or IP address of the remote computer.
+    
+    .PARAMETER Session
+        An existing PSSession to replace. Connection details (ComputerName, UserName, Port)
+        are extracted from the session. The old session is removed after the new one is created.
+        Provide -Credential if the original session used password-based authentication.
     
     .PARAMETER Credential
         Optional PSCredential object. If not specified, SSH will use default key-based authentication.
@@ -199,7 +234,7 @@ function New-SshSession {
         Optional username. If Credential is provided, the username from the credential is used instead.
     
     .PARAMETER Port
-        SSH port. Defaults to 22.
+        SSH port. Defaults to 22, or the port from the original session when using -Session.
     
     .PARAMETER Options
         Additional SSH options as a hashtable, passed to New-PSSession -Options.
@@ -222,21 +257,28 @@ function New-SshSession {
     .EXAMPLE
         $session = New-SshSession -ComputerName server01 -SkipTest
         # Skips connectivity test for faster session creation
+    
+    .EXAMPLE
+        $session = New-SshSession -Session $session -Credential $cred
+        # Repairs a broken session by creating a fresh one with the same connection details
     #>
-    [CmdletBinding()]
+    [CmdletBinding(DefaultParameterSetName = 'ComputerName')]
     [OutputType([System.Management.Automation.Runspaces.PSSession])]
     param(
-        [Parameter(Mandatory, Position = 0)]
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'ComputerName')]
         [string]$ComputerName,
+
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Session')]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
 
         [Parameter(Position = 1)]
         [PSCredential]$Credential,
 
-        [Parameter()]
+        [Parameter(ParameterSetName = 'ComputerName')]
         [string]$UserName,
 
         [Parameter()]
-        [int]$Port = 22,
+        [int]$Port,
 
         [Parameter()]
         [hashtable]$Options,
@@ -247,6 +289,28 @@ function New-SshSession {
         [Parameter()]
         [int]$TestTimeoutSeconds = 30
     )
+
+    # If Session is provided, extract connection info and remove the old session
+    if ($PSCmdlet.ParameterSetName -eq 'Session') {
+        $info = Get-SshSessionInfo -Session $Session
+        $ComputerName = $info.ComputerName
+
+        if (-not $PSBoundParameters.ContainsKey('Port')) {
+            $Port = $info.Port
+        }
+
+        if (-not $Credential -and $info.UserName) {
+            $UserName = $info.UserName
+        }
+
+        Write-Verbose "Replacing session to '$ComputerName' (Id: $($Session.Id))."
+        Remove-PSSession -Session $Session -ErrorAction SilentlyContinue
+    }
+
+    # Default port if not explicitly set
+    if (-not $PSBoundParameters.ContainsKey('Port') -and $PSCmdlet.ParameterSetName -ne 'Session') {
+        $Port = 22
+    }
 
     # Test connectivity first unless skipped
     if (-not $SkipTest) {
@@ -267,6 +331,8 @@ function New-SshSession {
             throw "SSH connection test to '$ComputerName' failed. Use -Verbose for details or -SkipTest to bypass."
         }
     }
+
+    Write-Verbose "Creating SSH session to '$ComputerName' on port $Port."
 
     $sessionParams = @{
         HostName = $ComputerName
@@ -323,12 +389,17 @@ function Invoke-SshCommand {
         Convenience wrapper around Invoke-Command for SSH sessions. Supports credential-based
         authentication for one-liner scenarios. If a session is not provided but credentials are,
         creates an ephemeral session for the command.
+        
+        When -Session is the only connection parameter, the existing session is used directly
+        for command execution. When combined with -Credential, the session is repaired first
+        via New-SshSession -Session, but only if it is not in the 'Opened' state.
     
     .PARAMETER ComputerName
         The hostname or IP address of the remote computer. Required if Session is not provided.
     
     .PARAMETER Session
-        An existing PSSession to use. If provided, ComputerName and Credential are ignored.
+        An existing PSSession to use for command execution. When used alone, the session is
+        used as-is. When combined with -Credential, the session is repaired first.
     
     .PARAMETER Credential
         Optional PSCredential for authentication. Creates an ephemeral session if Session is not provided.
@@ -367,6 +438,7 @@ function Invoke-SshCommand {
         [System.Management.Automation.Runspaces.PSSession]$Session,
 
         [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter(ParameterSetName = 'Session')]
         [PSCredential]$Credential,
 
         [Parameter(Mandatory, Position = 1)]
@@ -381,10 +453,10 @@ function Invoke-SshCommand {
         [Parameter(ParameterSetName = 'ComputerName')]
         [int]$Port = 22,
 
-        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter()]
         [switch]$SkipTest,
 
-        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter()]
         [int]$TestTimeoutSeconds = 30
     )
 
@@ -400,9 +472,26 @@ function Invoke-SshCommand {
 
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
-            $invokeParams['Session'] = $Session
+            if ($Credential -and $Session.State -ne 'Opened') {
+                # Repair the broken session with new credentials
+                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing before invoking command."
+                $repairParams = @{
+                    Session            = $Session
+                    Credential         = $Credential
+                    SkipTest           = $SkipTest
+                    TestTimeoutSeconds = $TestTimeoutSeconds
+                }
+                $ephemeralSession = New-SshSession @repairParams
+                $invokeParams['Session'] = $ephemeralSession
+            }
+            else {
+                $invokeParams['Session'] = $Session
+                Write-Verbose "Invoking command on existing session '$($Session.ComputerName)'."
+            }
         }
         else {
+            Write-Verbose "Invoking command on '$ComputerName'."
+            
             $sessionParams = @{
                 ComputerName       = $ComputerName
                 Port               = $Port
@@ -449,7 +538,8 @@ function Send-SshFile {
         The hostname or IP address of the remote computer. Required if Session is not provided.
     
     .PARAMETER Session
-        An existing PSSession to use.
+        An existing PSSession to use. When used alone, the session is used directly.
+        When combined with -Credential, the session is repaired first if it is not in the 'Opened' state.
     
     .PARAMETER Credential
         Optional PSCredential for authentication.
@@ -478,6 +568,10 @@ function Send-SshFile {
     .EXAMPLE
         $session = New-SshSession -ComputerName server01 -Credential $cred
         Send-SshFile -Path .\scripts\ -Destination /opt/scripts/ -Session $session -Recurse
+    
+    .EXAMPLE
+        Send-SshFile -Path .\config.json -Destination /etc/myapp/ -Session $session -Credential $cred
+        # Repairs a broken session before sending files
     #>
     [CmdletBinding(DefaultParameterSetName = 'ComputerName')]
     param(
@@ -494,6 +588,7 @@ function Send-SshFile {
         [System.Management.Automation.Runspaces.PSSession]$Session,
 
         [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter(ParameterSetName = 'Session')]
         [PSCredential]$Credential,
 
         [Parameter(ParameterSetName = 'ComputerName')]
@@ -508,10 +603,10 @@ function Send-SshFile {
         [Parameter()]
         [switch]$Force,
 
-        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter()]
         [switch]$SkipTest,
 
-        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter()]
         [int]$TestTimeoutSeconds = 30
     )
 
@@ -527,9 +622,25 @@ function Send-SshFile {
 
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
-            $copyParams['ToSession'] = $Session
+            if ($Credential -and $Session.State -ne 'Opened') {
+                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing before sending files."
+                $repairParams = @{
+                    Session            = $Session
+                    Credential         = $Credential
+                    SkipTest           = $SkipTest
+                    TestTimeoutSeconds = $TestTimeoutSeconds
+                }
+                $ephemeralSession = New-SshSession @repairParams
+                $copyParams['ToSession'] = $ephemeralSession
+            }
+            else {
+                $copyParams['ToSession'] = $Session
+                Write-Verbose "Sending file(s) to existing session '$($Session.ComputerName)'."
+            }
         }
         else {
+            Write-Verbose "Sending file(s) to '$ComputerName'."
+            
             $sessionParams = @{
                 ComputerName       = $ComputerName
                 Port               = $Port
@@ -576,7 +687,8 @@ function Receive-SshFile {
         The hostname or IP address of the remote computer. Required if Session is not provided.
     
     .PARAMETER Session
-        An existing PSSession to use.
+        An existing PSSession to use. When used alone, the session is used directly.
+        When combined with -Credential, the session is repaired first if it is not in the 'Opened' state.
     
     .PARAMETER Credential
         Optional PSCredential for authentication.
@@ -605,6 +717,10 @@ function Receive-SshFile {
     .EXAMPLE
         $session = New-SshSession -ComputerName server01 -Credential $cred
         Receive-SshFile -Path /etc/myapp/ -Destination .\backup\ -Session $session -Recurse
+    
+    .EXAMPLE
+        Receive-SshFile -Path /var/log/app.log -Destination .\logs\ -Session $session -Credential $cred
+        # Repairs a broken session before receiving files
     #>
     [CmdletBinding(DefaultParameterSetName = 'ComputerName')]
     param(
@@ -621,6 +737,7 @@ function Receive-SshFile {
         [System.Management.Automation.Runspaces.PSSession]$Session,
 
         [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter(ParameterSetName = 'Session')]
         [PSCredential]$Credential,
 
         [Parameter(ParameterSetName = 'ComputerName')]
@@ -635,10 +752,10 @@ function Receive-SshFile {
         [Parameter()]
         [switch]$Force,
 
-        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter()]
         [switch]$SkipTest,
 
-        [Parameter(ParameterSetName = 'ComputerName')]
+        [Parameter()]
         [int]$TestTimeoutSeconds = 30
     )
 
@@ -654,9 +771,25 @@ function Receive-SshFile {
 
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
-            $copyParams['FromSession'] = $Session
+            if ($Credential -and $Session.State -ne 'Opened') {
+                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing before receiving files."
+                $repairParams = @{
+                    Session            = $Session
+                    Credential         = $Credential
+                    SkipTest           = $SkipTest
+                    TestTimeoutSeconds = $TestTimeoutSeconds
+                }
+                $ephemeralSession = New-SshSession @repairParams
+                $copyParams['FromSession'] = $ephemeralSession
+            }
+            else {
+                $copyParams['FromSession'] = $Session
+                Write-Verbose "Receiving file(s) from existing session '$($Session.ComputerName)'."
+            }
         }
         else {
+            Write-Verbose "Receiving file(s) from '$ComputerName'."
+            
             $sessionParams = @{
                 ComputerName       = $ComputerName
                 Port               = $Port
@@ -684,6 +817,221 @@ function Receive-SshFile {
     }
 }
 
+function Restart-SshComputer {
+    <#
+    .SYNOPSIS
+        Restarts a remote computer over SSH and returns a new session once it is back online.
+    
+    .DESCRIPTION
+        Sends Restart-Computer -Force to the remote host via an existing PSSession, waits for
+        the server to go down, polls until it comes back, optionally verifies stability for a
+        sustained period, then returns a fresh session via New-SshSession -Session.
+        
+        The stability check is designed for scenarios like domain controller promotion where
+        a server may restart multiple times. When -StableForSeconds is specified, the server
+        must respond to connectivity tests continuously for that duration. If the server drops
+        during the stability window, the timer resets and waiting continues.
+    
+    .PARAMETER Session
+        The existing PSSession to the remote computer. This session will be used to send the
+        restart command and will be replaced with a new session after the restart completes.
+    
+    .PARAMETER Credential
+        Optional PSCredential for creating the new session after restart. Since credentials
+        cannot be extracted from an existing PSSession, you must provide this if the original
+        session used password-based authentication. If omitted, key-based authentication is
+        used with the username from the original session.
+    
+    .PARAMETER RestartTimeoutSeconds
+        Maximum seconds to wait for the server to go down after sending the restart command.
+        If the server has not stopped responding within this time, an error is thrown indicating
+        that shutdown may be blocked. Defaults to 120.
+    
+    .PARAMETER WaitTimeoutSeconds
+        Maximum total seconds to wait for the server to come back online after it goes down.
+        This includes time spent in stability checks. Defaults to 600.
+    
+    .PARAMETER StableForSeconds
+        How long the server must respond to connectivity tests continuously before it is
+        considered truly online. If the server drops during this window, the timer resets.
+        Use higher values (e.g. 120-300) for scenarios with multiple reboots like DC promotion.
+        Defaults to 0 (first successful connection is sufficient).
+    
+    .PARAMETER PollIntervalSeconds
+        How often to test connectivity while waiting. Defaults to 5.
+    
+    .PARAMETER Port
+        SSH port. Defaults to the port from the original session, or 22 if not available.
+    
+    .EXAMPLE
+        $session = Restart-SshComputer -Session $session
+        # Simple restart, waits for the server to come back and returns a new session.
+    
+    .EXAMPLE
+        $session = Restart-SshComputer -Session $session -Credential $cred
+        # Restart with credential-based authentication for the new session.
+    
+    .EXAMPLE
+        $session = Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
+        # For DC promotion: waits up to 15 minutes, requires 2 minutes of continuous uptime.
+    
+    .EXAMPLE
+        $session = Restart-SshComputer -Session $session -StableForSeconds 60 -PollIntervalSeconds 10
+        # Custom stability and polling intervals for a server that takes long to settle.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.Runspaces.PSSession])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter()]
+        [int]$RestartTimeoutSeconds = 120,
+
+        [Parameter()]
+        [int]$WaitTimeoutSeconds = 600,
+
+        [Parameter()]
+        [int]$StableForSeconds = 0,
+
+        [Parameter()]
+        [int]$PollIntervalSeconds = 5,
+
+        [Parameter()]
+        [int]$Port
+    )
+
+    # Extract connection info from the existing session
+    $info = Get-SshSessionInfo -Session $Session
+    $computerName = $info.ComputerName
+    $userName = $info.UserName
+
+    # Determine port: explicit parameter > session value
+    if (-not $PSBoundParameters.ContainsKey('Port')) {
+        $Port = $info.Port
+    }
+
+    Write-Verbose "Restarting '$computerName' (user: $userName, port: $Port)."
+
+    # --- Phase 1: Send restart command ---
+    Write-Verbose "Phase 1: Sending Restart-Computer -Force to '$computerName'."
+    try {
+        Invoke-Command -Session $Session -ScriptBlock { Restart-Computer -Force } -ErrorAction SilentlyContinue
+    }
+    catch {
+        # Expected - the session will likely break as the server shuts down
+        Write-Verbose "Restart command completed or session broke (expected): $_"
+    }
+
+    # --- Phase 2: Wait for the server to go down ---
+    Write-Verbose "Phase 2: Waiting for '$computerName' to go down (timeout: ${RestartTimeoutSeconds}s)."
+
+    # Brief initial sleep to give the OS time to begin shutdown
+    Start-Sleep -Seconds 5
+
+    $testParams = @{
+        ComputerName   = $computerName
+        Port           = $Port
+        TimeoutSeconds = [Math]::Min(10, $PollIntervalSeconds)
+    }
+
+    if ($Credential) {
+        $testParams['Credential'] = $Credential
+    }
+    elseif ($userName) {
+        $testParams['UserName'] = $userName
+    }
+
+    $dropDeadline = (Get-Date).AddSeconds($RestartTimeoutSeconds)
+    $serverWentDown = $false
+
+    while ((Get-Date) -lt $dropDeadline) {
+        if (-not (Test-SshConnection @testParams)) {
+            $serverWentDown = $true
+            Write-Verbose "Server '$computerName' is no longer responding. Restart confirmed."
+            break
+        }
+        Write-Verbose "Server '$computerName' still responding, waiting for shutdown..."
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    if (-not $serverWentDown) {
+        throw "Server '$computerName' did not go down within $RestartTimeoutSeconds seconds. Shutdown may be blocked."
+    }
+
+    # --- Phase 3: Wait for the server to come back ---
+    Write-Verbose "Phase 3: Waiting for '$computerName' to come back online (timeout: ${WaitTimeoutSeconds}s)."
+
+    $waitDeadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
+    $isOnline = $false
+    $stableStart = $null
+
+    while ((Get-Date) -lt $waitDeadline) {
+        $reachable = Test-SshConnection @testParams
+
+        if ($reachable) {
+            if ($StableForSeconds -le 0) {
+                # No stability check required
+                $isOnline = $true
+                Write-Verbose "Server '$computerName' is back online."
+                break
+            }
+
+            # Stability check
+            if (-not $stableStart) {
+                $stableStart = Get-Date
+                Write-Verbose "Server '$computerName' responded. Starting stability check (${StableForSeconds}s required)."
+            }
+
+            $stableElapsed = ((Get-Date) - $stableStart).TotalSeconds
+            if ($stableElapsed -ge $StableForSeconds) {
+                $isOnline = $true
+                Write-Verbose "Server '$computerName' has been stable for $([int]$stableElapsed) seconds. Stability check passed."
+                break
+            }
+
+            $remaining = $StableForSeconds - [int]$stableElapsed
+            Write-Verbose "Server '$computerName' up for $([int]$stableElapsed)s, need ${remaining}s more for stability."
+        }
+        else {
+            if ($stableStart) {
+                Write-Verbose "Server '$computerName' dropped during stability check. Resetting timer."
+                $stableStart = $null
+            }
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    if (-not $isOnline) {
+        throw "Server '$computerName' did not come back online within $WaitTimeoutSeconds seconds."
+    }
+
+    # --- Phase 4: Create new session using New-SshSession -Session ---
+    Write-Verbose "Phase 4: Creating new session to '$computerName' via New-SshSession -Session."
+
+    $newSessionParams = @{
+        Session  = $Session
+        SkipTest = $true  # We already confirmed connectivity
+    }
+
+    if ($Credential) {
+        $newSessionParams['Credential'] = $Credential
+    }
+
+    if ($PSBoundParameters.ContainsKey('Port')) {
+        $newSessionParams['Port'] = $Port
+    }
+
+    $newSession = New-SshSession @newSessionParams
+
+    Write-Verbose "New session to '$computerName' created successfully (Id: $($newSession.Id))."
+    return $newSession
+}
+
 #endregion Public Functions
 
-Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile
+Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile, Restart-SshComputer

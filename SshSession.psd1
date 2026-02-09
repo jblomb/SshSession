@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.2.0'
+    ModuleVersion     = '1.4.0'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Blomman'
     CompanyName       = 'Unknown'
@@ -14,6 +14,7 @@
         'Invoke-SshCommand'
         'Send-SshFile'
         'Receive-SshFile'
+        'Restart-SshComputer'
     )
     
     CmdletsToExport   = @()
@@ -26,6 +27,17 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.4.0
+- Added -Session parameter to New-SshSession for repairing broken/disconnected sessions
+- Added -Session with -Credential support to Invoke-SshCommand, Send-SshFile, and Receive-SshFile
+- Restart-SshComputer now uses New-SshSession -Session internally for session replacement
+- Added private Get-SshSessionInfo helper for extracting connection details from existing sessions
+
+1.3.0
+- Added Restart-SshComputer for restarting remote servers and returning a new session
+- Supports stability checks for multi-reboot scenarios (e.g. DC promotion)
+- Configurable timeouts for shutdown detection, wait-for-online, and stability duration
+
 1.2.0
 - Fixed credential auth falling back to key-based auth
 - New-SshSession now forces password-only auth when credentials are provided

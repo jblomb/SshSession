@@ -6,6 +6,7 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 
 - **Simplified Credential Management**: Use `PSCredential` objects directly for password-based authentication, just like with WinRM-based remoting.
 - **Connection Testing with Timeout**: Automatically tests connectivity before creating sessions to avoid hanging on unreachable hosts.
+- **Session Repair**: Pass an existing broken or disconnected `PSSession` to any function to automatically replace it with a fresh session using the same connection details.
 - **Persistent and Ephemeral Sessions**: Create and manage persistent `PSSession` objects or use one-liner commands for quick, ephemeral operations.
 - **Familiar Syntax**: Works like native PowerShell Remoting (`*-PSSession`, `Invoke-Command`, `Copy-Item`).
 - **File Transfer Support**: Easily send and receive files and directories to and from remote systems over SSH.
@@ -83,6 +84,14 @@ $session = New-SshSession -ComputerName 'server.example.com' -Credential $cred -
 $session = New-SshSession -ComputerName 'server.example.com' -Credential $cred -TestTimeoutSeconds 10
 ```
 
+**Example 5: Repair a broken session**
+
+If a session is broken or disconnected, pass it to `-Session` to create a fresh replacement with the same connection details. The old session is removed automatically.
+
+```powershell
+$session = New-SshSession -Session $session -Credential $cred
+```
+
 ### `Invoke-SshCommand`
 
 Executes a command on a remote host. It can use an existing session or create a temporary (ephemeral) one.
@@ -103,6 +112,12 @@ Invoke-SshCommand -ComputerName 'server.example.com' -Credential $cred -ScriptBl
 }
 ```
 
+**Example 3: Repair a broken session and invoke a command**
+
+```powershell
+Invoke-SshCommand -Session $session -Credential $cred -ScriptBlock { Get-Process }
+```
+
 ### `Send-SshFile`
 
 Copies files or directories from your local machine to the remote host.
@@ -119,6 +134,12 @@ Send-SshFile -Path '.\local-config.json' -Destination '/etc/myapp/config.json' -
 ```powershell
 $cred = Get-Credential
 Send-SshFile -Path '.\scripts' -Destination '/opt/scripts' -ComputerName 'server.example.com' -Credential $cred -Recurse
+```
+
+**Example 3: Repair a broken session and send files**
+
+```powershell
+Send-SshFile -Path '.\config.json' -Destination '/etc/myapp/' -Session $session -Credential $cred
 ```
 
 ### `Receive-SshFile`
@@ -139,6 +160,54 @@ Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -ComputerName 's
 Receive-SshFile -Path '/etc/myapp' -Destination '.\backup' -Session $session -Recurse
 ```
 
+**Example 3: Repair a broken session and receive files**
+
+```powershell
+Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -Session $session -Credential $cred
+```
+
+### `Restart-SshComputer`
+
+Restarts a remote computer, waits for it to come back online, and returns a new session. The old session is automatically removed. Supports a stability check for scenarios where the server may restart multiple times (e.g. domain controller promotion).
+
+**Example 1: Simple restart**
+
+```powershell
+$session = Restart-SshComputer -Session $session
+```
+
+**Example 2: Restart with credentials**
+
+Since credentials cannot be extracted from an existing `PSSession`, pass them explicitly if the session uses password authentication.
+
+```powershell
+$session = Restart-SshComputer -Session $session -Credential $cred
+```
+
+**Example 3: Domain controller promotion (multiple reboots)**
+
+Wait up to 15 minutes for the server to come back, and require it to stay up for 2 minutes continuously before considering it stable.
+
+```powershell
+$session = Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
+```
+
+**Example 4: Custom polling interval**
+
+```powershell
+$session = Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbose
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `-Session` | The existing `PSSession` to restart. Will be removed after the restart. |
+| `-Credential` | Optional credential for the new session. Required if the original session used password auth. |
+| `-RestartTimeoutSeconds` | Max seconds to wait for the server to go down (default: 120). |
+| `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
+| `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
+| `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
+| `-Port` | SSH port. Defaults to the port from the original session. |
+
 ## Common Parameters
 
 The following parameters are available on `New-SshSession`, `Invoke-SshCommand`, `Send-SshFile`, and `Receive-SshFile` when creating ephemeral sessions:
@@ -147,6 +216,22 @@ The following parameters are available on `New-SshSession`, `Invoke-SshCommand`,
 |-----------|-------------|
 | `-SkipTest` | Skip the connectivity test before creating the session. Use when you're confident the host is reachable or when the test overhead is undesirable. |
 | `-TestTimeoutSeconds` | Timeout for the connectivity test in seconds. Defaults to 30. Ignored if `-SkipTest` is specified. |
+
+## Session Repair
+
+All functions that accept a `-Session` parameter also support session repair. When you pass `-Session` together with `-Credential`, the function will create a fresh replacement session using the connection details from the old session. This is useful when a session has broken due to a network interruption or timeout.
+
+```powershell
+# Session broke? Just pass it back with credentials to repair:
+$session = New-SshSession -Session $session -Credential $cred
+
+# Or repair inline with any operation:
+Invoke-SshCommand -Session $session -Credential $cred -ScriptBlock { Get-Date }
+Send-SshFile -Path .\file.txt -Destination /tmp/ -Session $session -Credential $cred
+Receive-SshFile -Path /tmp/file.txt -Destination .\ -Session $session -Credential $cred
+```
+
+Note: For `Invoke-SshCommand`, `Send-SshFile`, and `Receive-SshFile`, the repaired session is ephemeral and cleaned up after the operation. For `New-SshSession`, the new session is returned for continued use.
 
 ## Credential Handling
 
