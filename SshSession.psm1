@@ -892,15 +892,217 @@ function Receive-SshFile {
     }
 }
 
+function Wait-SshComputer {
+    <#
+    .SYNOPSIS
+        Waits for a remote computer to complete a potential restart and ensures the SSH session is working.
+    
+    .DESCRIPTION
+        Acts as a checkpoint after running a command that might restart the remote computer.
+        Monitors the connection during a grace period to detect if a shutdown occurs. If the
+        server goes down, waits for it to come back online (with optional stability checking)
+        and repairs the session in-place so the caller's variable remains usable.
+        
+        If the server never goes down during the grace period, the function returns quietly
+        since the session is still healthy.
+        
+        The stability check is designed for scenarios like domain controller promotion where
+        a server may restart multiple times. When -StableForSeconds is specified, the server
+        must respond to connectivity tests continuously for that duration. If the server drops
+        during the stability window, the timer resets and waiting continues.
+        
+        The session is repaired in-place using reflection, so no reassignment is needed. After
+        this function returns, the caller's session variable is guaranteed to be working.
+    
+    .PARAMETER Session
+        The existing PSSession to monitor. If a restart is detected, the session is repaired
+        in-place so the caller's variable remains usable without reassignment.
+    
+    .PARAMETER Credential
+        Optional PSCredential for repairing the session after a restart. Required if the
+        original session used password-based authentication. If omitted and a restart occurs,
+        key-based authentication is attempted using the username from the original session.
+    
+    .PARAMETER ShutdownGracePeriodSeconds
+        How long to monitor the connection for a shutdown. If the server has not stopped
+        responding within this time, the function assumes no restart occurred and returns.
+        This should always be long enough for the OS to begin shutting down. Defaults to 60.
+    
+    .PARAMETER WaitTimeoutSeconds
+        Maximum total seconds to wait for the server to come back online after it goes down.
+        This includes time spent in stability checks. Defaults to 600.
+    
+    .PARAMETER StableForSeconds
+        How long the server must respond to connectivity tests continuously before it is
+        considered truly online. If the server drops during this window, the timer resets.
+        Use higher values (e.g. 120-300) for scenarios with multiple reboots like DC promotion.
+        Defaults to 0 (first successful connection is sufficient).
+    
+    .PARAMETER PollIntervalSeconds
+        How often to test connectivity while waiting. Defaults to 5.
+    
+    .PARAMETER Port
+        SSH port. Defaults to the port from the original session, or 22 if not available.
+    
+    .EXAMPLE
+        Invoke-Command -Session $session -ScriptBlock { Install-WindowsFeature AD-Domain-Services -Restart }
+        Wait-SshComputer -Session $session -Credential $cred
+        # $session is guaranteed working here, whether or not a restart occurred
+    
+    .EXAMPLE
+        Invoke-SshCommand -Session $session -ScriptBlock { Install-ADDSForest -DomainName 'corp.local' -Force }
+        Wait-SshComputer -Session $session -Credential $cred -ShutdownGracePeriodSeconds 120 -WaitTimeoutSeconds 900 -StableForSeconds 120
+        # For DC promotion: gives 2 minutes for shutdown, waits up to 15 minutes, requires 2 minutes of stability
+    
+    .EXAMPLE
+        Invoke-Command -Session $session -ScriptBlock { Start-Process 'setup.exe' -ArgumentList '/silent /restart' }
+        Wait-SshComputer -Session $session -ShutdownGracePeriodSeconds 30 -StableForSeconds 30
+        # Quick check with short grace period and stability requirement
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter()]
+        [int]$ShutdownGracePeriodSeconds = 60,
+
+        [Parameter()]
+        [int]$WaitTimeoutSeconds = 600,
+
+        [Parameter()]
+        [int]$StableForSeconds = 0,
+
+        [Parameter()]
+        [int]$PollIntervalSeconds = 5,
+
+        [Parameter()]
+        [int]$Port
+    )
+
+    # Extract connection info from the existing session
+    $info = Get-SshSessionInfo -Session $Session
+    $computerName = $info.ComputerName
+    $userName = $info.UserName
+
+    if (-not $PSBoundParameters.ContainsKey('Port')) {
+        $Port = $info.Port
+    }
+
+    Write-Verbose "Monitoring '$computerName' for potential restart (grace period: ${ShutdownGracePeriodSeconds}s)."
+
+    # --- Phase 1: Watch for shutdown during grace period ---
+    $testParams = @{
+        ComputerName   = $computerName
+        Port           = $Port
+        TimeoutSeconds = [Math]::Min(10, $PollIntervalSeconds)
+    }
+
+    if ($Credential) {
+        $testParams['Credential'] = $Credential
+    }
+    elseif ($userName) {
+        $testParams['UserName'] = $userName
+    }
+
+    $graceDeadline = (Get-Date).AddSeconds($ShutdownGracePeriodSeconds)
+    $serverWentDown = $false
+
+    while ((Get-Date) -lt $graceDeadline) {
+        if (-not (Test-SshConnection @testParams)) {
+            $serverWentDown = $true
+            Write-Verbose "Server '$computerName' is no longer responding. Restart detected."
+            break
+        }
+        Write-Verbose "Server '$computerName' still responding, monitoring for shutdown..."
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    if (-not $serverWentDown) {
+        Write-Verbose "Server '$computerName' remained online during grace period. No restart detected."
+        return
+    }
+
+    # --- Phase 2: Wait for the server to come back ---
+    Write-Verbose "Waiting for '$computerName' to come back online (timeout: ${WaitTimeoutSeconds}s)."
+
+    $waitDeadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
+    $isOnline = $false
+    $stableStart = $null
+
+    while ((Get-Date) -lt $waitDeadline) {
+        $reachable = Test-SshConnection @testParams
+
+        if ($reachable) {
+            if ($StableForSeconds -le 0) {
+                $isOnline = $true
+                Write-Verbose "Server '$computerName' is back online."
+                break
+            }
+
+            if (-not $stableStart) {
+                $stableStart = Get-Date
+                Write-Verbose "Server '$computerName' responded. Starting stability check (${StableForSeconds}s required)."
+            }
+
+            $stableElapsed = ((Get-Date) - $stableStart).TotalSeconds
+            if ($stableElapsed -ge $StableForSeconds) {
+                $isOnline = $true
+                Write-Verbose "Server '$computerName' has been stable for $([int]$stableElapsed) seconds. Stability check passed."
+                break
+            }
+
+            $remaining = $StableForSeconds - [int]$stableElapsed
+            Write-Verbose "Server '$computerName' up for $([int]$stableElapsed)s, need ${remaining}s more for stability."
+        }
+        else {
+            if ($stableStart) {
+                Write-Verbose "Server '$computerName' dropped during stability check. Resetting timer."
+                $stableStart = $null
+            }
+        }
+
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    if (-not $isOnline) {
+        throw "Server '$computerName' did not come back online within $WaitTimeoutSeconds seconds."
+    }
+
+    # --- Phase 3: Repair the session in-place ---
+    Write-Verbose "Repairing session to '$computerName' in-place."
+
+    $newSessionParams = @{
+        ComputerName = $computerName
+        Port         = $Port
+        SkipTest     = $true  # We already confirmed connectivity
+    }
+
+    if ($Credential) {
+        $newSessionParams['Credential'] = $Credential
+    }
+    elseif ($userName) {
+        $newSessionParams['UserName'] = $userName
+    }
+
+    $newSession = New-SshSession @newSessionParams
+    Copy-SshSession -OldSession $Session -NewSession $newSession
+
+    Write-Verbose "Session to '$computerName' repaired successfully."
+}
+
 function Restart-SshComputer {
     <#
     .SYNOPSIS
         Restarts a remote computer over SSH and returns a new session once it is back online.
     
     .DESCRIPTION
-        Sends Restart-Computer -Force to the remote host via an existing PSSession, waits for
-        the server to go down, polls until it comes back, optionally verifies stability for a
-        sustained period, then returns a fresh session via New-SshSession -Session.
+        Sends Restart-Computer -Force to the remote host via an existing PSSession, then uses
+        Wait-SshComputer to wait for the server to go down, come back online, and optionally
+        verify stability. Returns the session once the server is ready.
         
         The stability check is designed for scenarios like domain controller promotion where
         a server may restart multiple times. When -StableForSeconds is specified, the server
@@ -909,18 +1111,19 @@ function Restart-SshComputer {
     
     .PARAMETER Session
         The existing PSSession to the remote computer. This session will be used to send the
-        restart command and will be replaced with a new session after the restart completes.
+        restart command and will be repaired in-place after the restart completes.
     
     .PARAMETER Credential
-        Optional PSCredential for creating the new session after restart. Since credentials
+        Optional PSCredential for repairing the session after restart. Since credentials
         cannot be extracted from an existing PSSession, you must provide this if the original
         session used password-based authentication. If omitted, key-based authentication is
         used with the username from the original session.
     
-    .PARAMETER RestartTimeoutSeconds
+    .PARAMETER ShutdownGracePeriodSeconds
         Maximum seconds to wait for the server to go down after sending the restart command.
-        If the server has not stopped responding within this time, an error is thrown indicating
-        that shutdown may be blocked. Defaults to 120.
+        This should be long enough for the OS to begin shutting down. If the server has not
+        stopped responding within this time, Wait-SshComputer assumes no restart occurred
+        and returns. Defaults to 120.
     
     .PARAMETER WaitTimeoutSeconds
         Maximum total seconds to wait for the server to come back online after it goes down.
@@ -964,7 +1167,7 @@ function Restart-SshComputer {
         [PSCredential]$Credential,
 
         [Parameter()]
-        [int]$RestartTimeoutSeconds = 120,
+        [int]$ShutdownGracePeriodSeconds = 120,
 
         [Parameter()]
         [int]$WaitTimeoutSeconds = 600,
@@ -979,20 +1182,12 @@ function Restart-SshComputer {
         [int]$Port
     )
 
-    # Extract connection info from the existing session
-    $info = Get-SshSessionInfo -Session $Session
-    $computerName = $info.ComputerName
-    $userName = $info.UserName
+    $computerName = $Session.ComputerName
 
-    # Determine port: explicit parameter > session value
-    if (-not $PSBoundParameters.ContainsKey('Port')) {
-        $Port = $info.Port
-    }
+    Write-Verbose "Restarting '$computerName'."
 
-    Write-Verbose "Restarting '$computerName' (user: $userName, port: $Port)."
-
-    # --- Phase 1: Send restart command ---
-    Write-Verbose "Phase 1: Sending Restart-Computer -Force to '$computerName'."
+    # --- Send restart command ---
+    Write-Verbose "Sending Restart-Computer -Force to '$computerName'."
     try {
         Invoke-Command -Session $Session -ScriptBlock { Restart-Computer -Force } -ErrorAction SilentlyContinue
     }
@@ -1001,112 +1196,32 @@ function Restart-SshComputer {
         Write-Verbose "Restart command completed or session broke (expected): $_"
     }
 
-    # --- Phase 2: Wait for the server to go down ---
-    Write-Verbose "Phase 2: Waiting for '$computerName' to go down (timeout: ${RestartTimeoutSeconds}s)."
-
     # Brief initial sleep to give the OS time to begin shutdown
     Start-Sleep -Seconds 5
 
-    $testParams = @{
-        ComputerName   = $computerName
-        Port           = $Port
-        TimeoutSeconds = [Math]::Min(10, $PollIntervalSeconds)
+    # --- Wait for restart and repair session in-place ---
+    $waitParams = @{
+        Session                    = $Session
+        ShutdownGracePeriodSeconds = $ShutdownGracePeriodSeconds
+        WaitTimeoutSeconds         = $WaitTimeoutSeconds
+        StableForSeconds           = $StableForSeconds
+        PollIntervalSeconds        = $PollIntervalSeconds
     }
 
     if ($Credential) {
-        $testParams['Credential'] = $Credential
-    }
-    elseif ($userName) {
-        $testParams['UserName'] = $userName
-    }
-
-    $dropDeadline = (Get-Date).AddSeconds($RestartTimeoutSeconds)
-    $serverWentDown = $false
-
-    while ((Get-Date) -lt $dropDeadline) {
-        if (-not (Test-SshConnection @testParams)) {
-            $serverWentDown = $true
-            Write-Verbose "Server '$computerName' is no longer responding. Restart confirmed."
-            break
-        }
-        Write-Verbose "Server '$computerName' still responding, waiting for shutdown..."
-        Start-Sleep -Seconds $PollIntervalSeconds
-    }
-
-    if (-not $serverWentDown) {
-        throw "Server '$computerName' did not go down within $RestartTimeoutSeconds seconds. Shutdown may be blocked."
-    }
-
-    # --- Phase 3: Wait for the server to come back ---
-    Write-Verbose "Phase 3: Waiting for '$computerName' to come back online (timeout: ${WaitTimeoutSeconds}s)."
-
-    $waitDeadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
-    $isOnline = $false
-    $stableStart = $null
-
-    while ((Get-Date) -lt $waitDeadline) {
-        $reachable = Test-SshConnection @testParams
-
-        if ($reachable) {
-            if ($StableForSeconds -le 0) {
-                # No stability check required
-                $isOnline = $true
-                Write-Verbose "Server '$computerName' is back online."
-                break
-            }
-
-            # Stability check
-            if (-not $stableStart) {
-                $stableStart = Get-Date
-                Write-Verbose "Server '$computerName' responded. Starting stability check (${StableForSeconds}s required)."
-            }
-
-            $stableElapsed = ((Get-Date) - $stableStart).TotalSeconds
-            if ($stableElapsed -ge $StableForSeconds) {
-                $isOnline = $true
-                Write-Verbose "Server '$computerName' has been stable for $([int]$stableElapsed) seconds. Stability check passed."
-                break
-            }
-
-            $remaining = $StableForSeconds - [int]$stableElapsed
-            Write-Verbose "Server '$computerName' up for $([int]$stableElapsed)s, need ${remaining}s more for stability."
-        }
-        else {
-            if ($stableStart) {
-                Write-Verbose "Server '$computerName' dropped during stability check. Resetting timer."
-                $stableStart = $null
-            }
-        }
-
-        Start-Sleep -Seconds $PollIntervalSeconds
-    }
-
-    if (-not $isOnline) {
-        throw "Server '$computerName' did not come back online within $WaitTimeoutSeconds seconds."
-    }
-
-    # --- Phase 4: Create new session using New-SshSession -Session ---
-    Write-Verbose "Phase 4: Creating new session to '$computerName' via New-SshSession -Session."
-
-    $newSessionParams = @{
-        Session  = $Session
-        SkipTest = $true  # We already confirmed connectivity
-    }
-
-    if ($Credential) {
-        $newSessionParams['Credential'] = $Credential
+        $waitParams['Credential'] = $Credential
     }
 
     if ($PSBoundParameters.ContainsKey('Port')) {
-        $newSessionParams['Port'] = $Port
+        $waitParams['Port'] = $Port
     }
 
-    $newSession = New-SshSession @newSessionParams
+    Wait-SshComputer @waitParams
 
-    Write-Verbose "New session to '$computerName' created successfully (Id: $($newSession.Id))."
-    return $newSession
+    Write-Verbose "Restart of '$computerName' completed. Session is ready."
+    return $Session
 }
 
 #endregion Public Functions
 
-Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile, Restart-SshComputer
+Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile, Wait-SshComputer, Restart-SshComputer

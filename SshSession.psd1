@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.5.0'
+    ModuleVersion     = '1.6.0'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Blomman'
     CompanyName       = 'Unknown'
@@ -14,6 +14,7 @@
         'Invoke-SshCommand'
         'Send-SshFile'
         'Receive-SshFile'
+        'Wait-SshComputer'
         'Restart-SshComputer'
     )
     
@@ -27,6 +28,13 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.6.0
+- Added Wait-SshComputer for waiting on potential restarts and repairing sessions in-place
+- Monitors a shutdown grace period to detect if the server goes down, then waits for online with optional stability check
+- Session is repaired in-place via reflection when a restart is detected, no reassignment needed
+- Refactored Restart-SshComputer to use Wait-SshComputer internally
+- Restart-SshComputer now uses ShutdownGracePeriodSeconds instead of RestartTimeoutSeconds (breaking change)
+
 1.5.0
 - In-place session repair for Invoke-SshCommand, Send-SshFile, and Receive-SshFile
 - When a broken session is repaired, the caller's variable is updated in-place via reflection

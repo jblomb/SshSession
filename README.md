@@ -7,6 +7,7 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 - **Simplified Credential Management**: Use `PSCredential` objects directly for password-based authentication, just like with WinRM-based remoting.
 - **Connection Testing with Timeout**: Automatically tests connectivity before creating sessions to avoid hanging on unreachable hosts.
 - **Session Repair**: Pass an existing broken or disconnected `PSSession` to any function to automatically replace it with a fresh session using the same connection details.
+- **Restart & Wait**: Restart remote computers and wait for them to come back online, or use `Wait-SshComputer` as a standalone checkpoint after commands that might trigger a reboot.
 - **Persistent and Ephemeral Sessions**: Create and manage persistent `PSSession` objects or use one-liner commands for quick, ephemeral operations.
 - **Familiar Syntax**: Works like native PowerShell Remoting (`*-PSSession`, `Invoke-Command`, `Copy-Item`).
 - **File Transfer Support**: Easily send and receive files and directories to and from remote systems over SSH.
@@ -166,9 +167,49 @@ Receive-SshFile -Path '/etc/myapp' -Destination '.\backup' -Session $session -Re
 Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -Session $session -Credential $cred
 ```
 
+### `Wait-SshComputer`
+
+Waits for a remote computer to complete a potential restart and ensures the SSH session is working afterward. Acts as a checkpoint after running a command that might cause a reboot. If the server goes down during the grace period, waits for it to come back online (with optional stability checking) and repairs the session in-place. If the server never goes down, returns quietly.
+
+**Example 1: Wait after a command that might restart**
+
+```powershell
+Invoke-Command -Session $session -ScriptBlock { Install-WindowsFeature AD-Domain-Services -Restart }
+Wait-SshComputer -Session $session -Credential $cred
+
+# $session is guaranteed working here, whether or not a restart occurred
+Invoke-SshCommand -Session $session -ScriptBlock { Get-WindowsFeature AD-Domain-Services }
+```
+
+**Example 2: Domain controller promotion (multiple reboots)**
+
+Give 2 minutes for shutdown to begin, wait up to 15 minutes, and require 2 minutes of continuous uptime before considering the server stable.
+
+```powershell
+Invoke-SshCommand -Session $session -ScriptBlock { Install-ADDSForest -DomainName 'corp.local' -Force }
+Wait-SshComputer -Session $session -Credential $cred -ShutdownGracePeriodSeconds 120 -WaitTimeoutSeconds 900 -StableForSeconds 120
+```
+
+**Example 3: Quick check with short grace period**
+
+```powershell
+Invoke-Command -Session $session -ScriptBlock { Start-Process 'setup.exe' -ArgumentList '/silent /restart' }
+Wait-SshComputer -Session $session -ShutdownGracePeriodSeconds 30 -StableForSeconds 30
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `-Session` | The existing `PSSession` to monitor. Repaired in-place if a restart is detected. |
+| `-Credential` | Optional credential for repairing the session. Required if the original session used password auth. |
+| `-ShutdownGracePeriodSeconds` | How long to monitor for a shutdown before assuming no restart occurred (default: 60). |
+| `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
+| `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
+| `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
+| `-Port` | SSH port. Defaults to the port from the original session. |
+
 ### `Restart-SshComputer`
 
-Restarts a remote computer, waits for it to come back online, and returns a new session. The old session is automatically removed. Supports a stability check for scenarios where the server may restart multiple times (e.g. domain controller promotion).
+Restarts a remote computer, waits for it to come back online, and returns the repaired session. Uses `Wait-SshComputer` internally for the shutdown detection and wait logic. Supports a stability check for scenarios where the server may restart multiple times (e.g. domain controller promotion).
 
 **Example 1: Simple restart**
 
@@ -200,9 +241,9 @@ $session = Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbos
 
 | Parameter | Description |
 |-----------|-------------|
-| `-Session` | The existing `PSSession` to restart. Will be removed after the restart. |
-| `-Credential` | Optional credential for the new session. Required if the original session used password auth. |
-| `-RestartTimeoutSeconds` | Max seconds to wait for the server to go down (default: 120). |
+| `-Session` | The existing `PSSession` to restart. Repaired in-place after the restart. |
+| `-Credential` | Optional credential for repairing the session. Required if the original session used password auth. |
+| `-ShutdownGracePeriodSeconds` | How long to monitor for a shutdown after sending the restart command (default: 120). |
 | `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
 | `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
 | `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
@@ -221,16 +262,24 @@ The following parameters are available on `New-SshSession`, `Invoke-SshCommand`,
 
 All functions that accept a `-Session` parameter also support session repair. When you pass `-Session` together with `-Credential`, the function will create a fresh replacement session using the connection details from the old session. This is useful when a session has broken due to a network interruption, timeout, or server restart.
 
-For `Invoke-SshCommand`, `Send-SshFile`, and `Receive-SshFile`, the repair happens **in-place** — the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
+For `Invoke-SshCommand`, `Send-SshFile`, `Receive-SshFile`, and `Wait-SshComputer`, the repair happens **in-place** â€” the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
 
 ```powershell
-# Session broke after a reboot? These just work — $session is repaired in-place:
+# Session broke after a reboot? These just work â€” $session is repaired in-place:
 Invoke-SshCommand -Session $session -Credential $cred -ScriptBlock { Get-Date }
 Send-SshFile -Path .\file.txt -Destination /tmp/ -Session $session -Credential $cred
 Receive-SshFile -Path /tmp/file.txt -Destination .\ -Session $session -Credential $cred
 
-# $session is now working again — no reassignment needed!
+# $session is now working again â€” no reassignment needed!
 Invoke-SshCommand -Session $session -ScriptBlock { hostname }
+```
+
+`Wait-SshComputer` is especially useful as a standalone checkpoint after running commands that might trigger a restart:
+
+```powershell
+Invoke-Command -Session $session -ScriptBlock { Install-WindowsFeature ADDS -Restart }
+Wait-SshComputer -Session $session -Credential $cred
+# $session is working again - no reassignment needed!
 ```
 
 For `New-SshSession` and `Restart-SshComputer`, a new session object is returned (assign it back to your variable):
