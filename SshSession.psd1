@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.4.0'
+    ModuleVersion     = '1.5.0'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Blomman'
     CompanyName       = 'Unknown'
@@ -27,6 +27,13 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.5.0
+- In-place session repair for Invoke-SshCommand, Send-SshFile, and Receive-SshFile
+- When a broken session is repaired, the caller's variable is updated in-place via reflection
+- No longer requires reassigning the session variable after repair in these functions
+- Added private Copy-SshSession helper for reflection-based session transplant
+- New-SshSession -Session and Restart-SshComputer still return new session objects (unchanged)
+
 1.4.0
 - Added -Session parameter to New-SshSession for repairing broken/disconnected sessions
 - Added -Session with -Credential support to Invoke-SshCommand, Send-SshFile, and Receive-SshFile

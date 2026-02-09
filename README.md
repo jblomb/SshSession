@@ -219,19 +219,28 @@ The following parameters are available on `New-SshSession`, `Invoke-SshCommand`,
 
 ## Session Repair
 
-All functions that accept a `-Session` parameter also support session repair. When you pass `-Session` together with `-Credential`, the function will create a fresh replacement session using the connection details from the old session. This is useful when a session has broken due to a network interruption or timeout.
+All functions that accept a `-Session` parameter also support session repair. When you pass `-Session` together with `-Credential`, the function will create a fresh replacement session using the connection details from the old session. This is useful when a session has broken due to a network interruption, timeout, or server restart.
+
+For `Invoke-SshCommand`, `Send-SshFile`, and `Receive-SshFile`, the repair happens **in-place** — the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
 
 ```powershell
-# Session broke? Just pass it back with credentials to repair:
-$session = New-SshSession -Session $session -Credential $cred
-
-# Or repair inline with any operation:
+# Session broke after a reboot? These just work — $session is repaired in-place:
 Invoke-SshCommand -Session $session -Credential $cred -ScriptBlock { Get-Date }
 Send-SshFile -Path .\file.txt -Destination /tmp/ -Session $session -Credential $cred
 Receive-SshFile -Path /tmp/file.txt -Destination .\ -Session $session -Credential $cred
+
+# $session is now working again — no reassignment needed!
+Invoke-SshCommand -Session $session -ScriptBlock { hostname }
 ```
 
-Note: For `Invoke-SshCommand`, `Send-SshFile`, and `Receive-SshFile`, the repaired session is ephemeral and cleaned up after the operation. For `New-SshSession`, the new session is returned for continued use.
+For `New-SshSession` and `Restart-SshComputer`, a new session object is returned (assign it back to your variable):
+
+```powershell
+$session = New-SshSession -Session $session -Credential $cred
+$session = Restart-SshComputer -Session $session -Credential $cred
+```
+
+**Note on `Get-PSSession`**: The in-place repair uses reflection to transplant connection internals into the existing PSSession object. As a side effect, the repaired session will not appear in `Get-PSSession` output (the session registry still tracks the original entry). The session works correctly through the caller's variable, and all objects are cleaned up when the PowerShell process exits.
 
 ## Credential Handling
 

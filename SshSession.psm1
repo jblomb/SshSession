@@ -72,6 +72,75 @@ function Get-SshSessionInfo {
     }
 }
 
+function Copy-SshSession {
+    <#
+        Replaces the internals of an existing PSSession with those from a new session
+        using reflection. This updates the caller's session variable in-place so it
+        points to a working connection without requiring reassignment.
+
+        The original session's Id, Name, and InstanceId are preserved so the variable
+        identity stays consistent from the caller's perspective.
+
+        Note: The updated session will not appear in Get-PSSession since the session
+        registry still tracks the original (now-hollow) entry. This is acceptable for
+        sessions managed by the caller's variable, and all objects are cleaned up when
+        the PowerShell process exits.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Runspaces.PSSession]$OldSession,
+
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Runspaces.PSSession]$NewSession
+    )
+
+    $type = [System.Management.Automation.Runspaces.PSSession]
+
+    # Dispose the old runspace to avoid resource leaks
+    try {
+        $OldSession.Runspace.Close()
+        $OldSession.Runspace.Dispose()
+    }
+    catch {
+        Write-Verbose "Could not dispose old runspace: $_"
+    }
+
+    # Preserve identity fields
+    $oldId = $OldSession.Id
+    $oldName = $OldSession.Name
+    $oldInstanceId = $OldSession.InstanceId
+
+    # Copy all fields from new session to old session
+    foreach ($field in $type.GetFields('NonPublic,Instance')) {
+        try {
+            $field.SetValue($OldSession, $field.GetValue($NewSession))
+        }
+        catch {
+            Write-Verbose "Could not copy field '$($field.Name)': $_"
+        }
+    }
+
+    # Restore identity fields so the caller's variable looks the same
+    $identityFields = @{
+        '<Id>k__BackingField'         = $oldId
+        '<Name>k__BackingField'       = $oldName
+        '<InstanceId>k__BackingField' = $oldInstanceId
+    }
+
+    foreach ($entry in $identityFields.GetEnumerator()) {
+        $field = $type.GetField($entry.Key, 'NonPublic,Instance')
+        if ($field) {
+            $field.SetValue($OldSession, $entry.Value)
+        }
+        else {
+            Write-Verbose "Identity field '$($entry.Key)' not found. .NET runtime may have changed backing field names."
+        }
+    }
+
+    Write-Verbose "Refreshed session '$oldName' (Id: $oldId) with connection from session $($NewSession.Id)."
+}
+
 #endregion Private Functions
 
 #region Public Functions
@@ -392,7 +461,8 @@ function Invoke-SshCommand {
         
         When -Session is the only connection parameter, the existing session is used directly
         for command execution. When combined with -Credential, the session is repaired first
-        via New-SshSession -Session, but only if it is not in the 'Opened' state.
+        if it is not in the 'Opened' state. The repair updates the caller's session variable
+        in-place using reflection, so it remains usable after the command completes.
     
     .PARAMETER ComputerName
         The hostname or IP address of the remote computer. Required if Session is not provided.
@@ -473,16 +543,17 @@ function Invoke-SshCommand {
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
             if ($Credential -and $Session.State -ne 'Opened') {
-                # Repair the broken session with new credentials
-                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing before invoking command."
+                # Repair the broken session in-place with new credentials
+                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before invoking command."
                 $repairParams = @{
                     Session            = $Session
                     Credential         = $Credential
                     SkipTest           = $SkipTest
                     TestTimeoutSeconds = $TestTimeoutSeconds
                 }
-                $ephemeralSession = New-SshSession @repairParams
-                $invokeParams['Session'] = $ephemeralSession
+                $repairedSession = New-SshSession @repairParams
+                Copy-SshSession -OldSession $Session -NewSession $repairedSession
+                $invokeParams['Session'] = $Session
             }
             else {
                 $invokeParams['Session'] = $Session
@@ -539,7 +610,8 @@ function Send-SshFile {
     
     .PARAMETER Session
         An existing PSSession to use. When used alone, the session is used directly.
-        When combined with -Credential, the session is repaired first if it is not in the 'Opened' state.
+        When combined with -Credential, the session is repaired in-place first if it is
+        not in the 'Opened' state, so the caller's variable remains usable afterward.
     
     .PARAMETER Credential
         Optional PSCredential for authentication.
@@ -623,15 +695,16 @@ function Send-SshFile {
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
             if ($Credential -and $Session.State -ne 'Opened') {
-                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing before sending files."
+                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before sending files."
                 $repairParams = @{
                     Session            = $Session
                     Credential         = $Credential
                     SkipTest           = $SkipTest
                     TestTimeoutSeconds = $TestTimeoutSeconds
                 }
-                $ephemeralSession = New-SshSession @repairParams
-                $copyParams['ToSession'] = $ephemeralSession
+                $repairedSession = New-SshSession @repairParams
+                Copy-SshSession -OldSession $Session -NewSession $repairedSession
+                $copyParams['ToSession'] = $Session
             }
             else {
                 $copyParams['ToSession'] = $Session
@@ -688,7 +761,8 @@ function Receive-SshFile {
     
     .PARAMETER Session
         An existing PSSession to use. When used alone, the session is used directly.
-        When combined with -Credential, the session is repaired first if it is not in the 'Opened' state.
+        When combined with -Credential, the session is repaired in-place first if it is
+        not in the 'Opened' state, so the caller's variable remains usable afterward.
     
     .PARAMETER Credential
         Optional PSCredential for authentication.
@@ -772,15 +846,16 @@ function Receive-SshFile {
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
             if ($Credential -and $Session.State -ne 'Opened') {
-                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing before receiving files."
+                Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before receiving files."
                 $repairParams = @{
                     Session            = $Session
                     Credential         = $Credential
                     SkipTest           = $SkipTest
                     TestTimeoutSeconds = $TestTimeoutSeconds
                 }
-                $ephemeralSession = New-SshSession @repairParams
-                $copyParams['FromSession'] = $ephemeralSession
+                $repairedSession = New-SshSession @repairParams
+                Copy-SshSession -OldSession $Session -NewSession $repairedSession
+                $copyParams['FromSession'] = $Session
             }
             else {
                 $copyParams['FromSession'] = $Session
