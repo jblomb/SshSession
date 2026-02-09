@@ -32,7 +32,7 @@
 - Added Wait-SshComputer for waiting on potential restarts and repairing sessions in-place
 - Monitors a shutdown grace period to detect if the server goes down, then waits for online with optional stability check
 - Session is repaired in-place via reflection when a restart is detected, no reassignment needed
-- Refactored Restart-SshComputer to use Wait-SshComputer internally
+- Refactored Restart-SshComputer to use Wait-SshComputer internally, now repairs in-place (no return value)
 - Restart-SshComputer now uses ShutdownGracePeriodSeconds instead of RestartTimeoutSeconds (breaking change)
 
 1.5.0

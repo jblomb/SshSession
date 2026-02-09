@@ -1097,12 +1097,12 @@ function Wait-SshComputer {
 function Restart-SshComputer {
     <#
     .SYNOPSIS
-        Restarts a remote computer over SSH and returns a new session once it is back online.
+        Restarts a remote computer over SSH and waits for it to come back online.
     
     .DESCRIPTION
         Sends Restart-Computer -Force to the remote host via an existing PSSession, then uses
         Wait-SshComputer to wait for the server to go down, come back online, and optionally
-        verify stability. Returns the session once the server is ready.
+        verify stability. The session is repaired in-place, so no reassignment is needed.
         
         The stability check is designed for scenarios like domain controller promotion where
         a server may restart multiple times. When -StableForSeconds is specified, the server
@@ -1142,23 +1142,22 @@ function Restart-SshComputer {
         SSH port. Defaults to the port from the original session, or 22 if not available.
     
     .EXAMPLE
-        $session = Restart-SshComputer -Session $session
-        # Simple restart, waits for the server to come back and returns a new session.
+        Restart-SshComputer -Session $session
+        # Simple restart, waits for the server to come back. $session is repaired in-place.
     
     .EXAMPLE
-        $session = Restart-SshComputer -Session $session -Credential $cred
-        # Restart with credential-based authentication for the new session.
+        Restart-SshComputer -Session $session -Credential $cred
+        # Restart with credential-based authentication. $session is repaired in-place.
     
     .EXAMPLE
-        $session = Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
+        Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
         # For DC promotion: waits up to 15 minutes, requires 2 minutes of continuous uptime.
     
     .EXAMPLE
-        $session = Restart-SshComputer -Session $session -StableForSeconds 60 -PollIntervalSeconds 10
+        Restart-SshComputer -Session $session -StableForSeconds 60 -PollIntervalSeconds 10
         # Custom stability and polling intervals for a server that takes long to settle.
     #>
     [CmdletBinding()]
-    [OutputType([System.Management.Automation.Runspaces.PSSession])]
     param(
         [Parameter(Mandatory, Position = 0)]
         [System.Management.Automation.Runspaces.PSSession]$Session,
@@ -1219,7 +1218,6 @@ function Restart-SshComputer {
     Wait-SshComputer @waitParams
 
     Write-Verbose "Restart of '$computerName' completed. Session is ready."
-    return $Session
 }
 
 #endregion Public Functions

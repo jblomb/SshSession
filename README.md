@@ -209,12 +209,12 @@ Wait-SshComputer -Session $session -ShutdownGracePeriodSeconds 30 -StableForSeco
 
 ### `Restart-SshComputer`
 
-Restarts a remote computer, waits for it to come back online, and returns the repaired session. Uses `Wait-SshComputer` internally for the shutdown detection and wait logic. Supports a stability check for scenarios where the server may restart multiple times (e.g. domain controller promotion).
+Restarts a remote computer, waits for it to come back online, and repairs the session in-place. Uses `Wait-SshComputer` internally for the shutdown detection and wait logic. Supports a stability check for scenarios where the server may restart multiple times (e.g. domain controller promotion).
 
 **Example 1: Simple restart**
 
 ```powershell
-$session = Restart-SshComputer -Session $session
+Restart-SshComputer -Session $session
 ```
 
 **Example 2: Restart with credentials**
@@ -222,7 +222,7 @@ $session = Restart-SshComputer -Session $session
 Since credentials cannot be extracted from an existing `PSSession`, pass them explicitly if the session uses password authentication.
 
 ```powershell
-$session = Restart-SshComputer -Session $session -Credential $cred
+Restart-SshComputer -Session $session -Credential $cred
 ```
 
 **Example 3: Domain controller promotion (multiple reboots)**
@@ -230,13 +230,13 @@ $session = Restart-SshComputer -Session $session -Credential $cred
 Wait up to 15 minutes for the server to come back, and require it to stay up for 2 minutes continuously before considering it stable.
 
 ```powershell
-$session = Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
+Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
 ```
 
 **Example 4: Custom polling interval**
 
 ```powershell
-$session = Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbose
+Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbose
 ```
 
 | Parameter | Description |
@@ -262,7 +262,7 @@ The following parameters are available on `New-SshSession`, `Invoke-SshCommand`,
 
 All functions that accept a `-Session` parameter also support session repair. When you pass `-Session` together with `-Credential`, the function will create a fresh replacement session using the connection details from the old session. This is useful when a session has broken due to a network interruption, timeout, or server restart.
 
-For `Invoke-SshCommand`, `Send-SshFile`, `Receive-SshFile`, and `Wait-SshComputer`, the repair happens **in-place** â€” the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
+For `Invoke-SshCommand`, `Send-SshFile`, `Receive-SshFile`, `Wait-SshComputer`, and `Restart-SshComputer`, the repair happens **in-place** â€” the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
 
 ```powershell
 # Session broke after a reboot? These just work â€” $session is repaired in-place:
@@ -282,11 +282,10 @@ Wait-SshComputer -Session $session -Credential $cred
 # $session is working again - no reassignment needed!
 ```
 
-For `New-SshSession` and `Restart-SshComputer`, a new session object is returned (assign it back to your variable):
+For `New-SshSession -Session`, a new session object is returned (assign it back to your variable):
 
 ```powershell
 $session = New-SshSession -Session $session -Credential $cred
-$session = Restart-SshComputer -Session $session -Credential $cred
 ```
 
 **Note on `Get-PSSession`**: The in-place repair uses reflection to transplant connection internals into the existing PSSession object. As a side effect, the repaired session will not appear in `Get-PSSession` output (the session registry still tracks the original entry). The session works correctly through the caller's variable, and all objects are cleaned up when the PowerShell process exits.
