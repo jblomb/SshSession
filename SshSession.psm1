@@ -97,15 +97,6 @@ function Copy-SshSession {
 
     $type = [System.Management.Automation.Runspaces.PSSession]
 
-    # Dispose the old runspace to avoid resource leaks
-    try {
-        $OldSession.Runspace.Close()
-        $OldSession.Runspace.Dispose()
-    }
-    catch {
-        Write-Verbose "Could not dispose old runspace: $_"
-    }
-
     # Preserve identity fields
     $oldId = $OldSession.Id
     $oldName = $OldSession.Name
