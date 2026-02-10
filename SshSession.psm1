@@ -85,8 +85,10 @@ function Copy-SshSession {
         using reflection. This updates the caller's session variable in-place so it
         points to a working connection without requiring reassignment.
 
-        The original session's Id, Name, and InstanceId are preserved so the variable
-        identity stays consistent from the caller's perspective.
+        The original session's Id and Name are preserved so the variable
+        identity stays consistent from the caller's perspective. InstanceId is
+        a read-only computed property (returns Runspace.InstanceId) and will
+        reflect the new connection's value after repair.
 
         Note: The updated session will not appear in Get-PSSession since the session
         registry still tracks the original (now-hollow) entry. This is acceptable for
@@ -107,7 +109,6 @@ function Copy-SshSession {
     # Preserve identity fields
     $oldId = $OldSession.Id
     $oldName = $OldSession.Name
-    $oldInstanceId = $OldSession.InstanceId
 
     # Copy all fields from new session to old session
     foreach ($field in $type.GetFields('NonPublic,Instance')) {
@@ -120,10 +121,11 @@ function Copy-SshSession {
     }
 
     # Restore identity fields so the caller's variable looks the same
+    # Note: InstanceId is not restored because it is a read-only computed property
+    # that returns Runspace.InstanceId -- there is no backing field to set.
     $identityFields = @{
-        '<Id>k__BackingField'         = $oldId
-        '<Name>k__BackingField'       = $oldName
-        '<InstanceId>k__BackingField' = $oldInstanceId
+        '<Id>k__BackingField'   = $oldId
+        '<Name>k__BackingField' = $oldName
     }
 
     foreach ($entry in $identityFields.GetEnumerator()) {
