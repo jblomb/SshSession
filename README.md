@@ -6,7 +6,7 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 
 - **Simplified Credential Management**: Use `PSCredential` objects directly for password-based authentication, just like with WinRM-based remoting.
 - **Connection Testing with Timeout**: Automatically tests connectivity before creating sessions to avoid hanging on unreachable hosts.
-- **Session Repair**: Pass an existing broken or disconnected `PSSession` to any function to automatically replace it with a fresh session using the same connection details.
+- **Session Repair**: Credentials are stored on the session object, enabling automatic repair of broken sessions without re-providing credentials. All functions handle this transparently.
 - **Restart & Wait**: Restart remote computers and wait for them to come back online, or use `Wait-SshComputer` as a standalone checkpoint after commands that might trigger a reboot.
 - **Persistent and Ephemeral Sessions**: Create and manage persistent `PSSession` objects or use one-liner commands for quick, ephemeral operations.
 - **Familiar Syntax**: Works like native PowerShell Remoting (`*-PSSession`, `Invoke-Command`, `Copy-Item`).
@@ -116,7 +116,11 @@ Invoke-SshCommand -ComputerName 'server.example.com' -Credential $cred -ScriptBl
 **Example 3: Repair a broken session and invoke a command**
 
 ```powershell
-Invoke-SshCommand -Session $session -Credential $cred -ScriptBlock { Get-Process }
+# If the session has a stored credential, repair is automatic:
+Invoke-SshCommand -Session $session -ScriptBlock { Get-Process }
+
+# Or override with a different credential:
+Invoke-SshCommand -Session $session -Credential $newCred -ScriptBlock { Get-Process }
 ```
 
 ### `Send-SshFile`
@@ -140,7 +144,7 @@ Send-SshFile -Path '.\scripts' -Destination '/opt/scripts' -ComputerName 'server
 **Example 3: Repair a broken session and send files**
 
 ```powershell
-Send-SshFile -Path '.\config.json' -Destination '/etc/myapp/' -Session $session -Credential $cred
+Send-SshFile -Path '.\config.json' -Destination '/etc/myapp/' -Session $session
 ```
 
 ### `Receive-SshFile`
@@ -164,7 +168,7 @@ Receive-SshFile -Path '/etc/myapp' -Destination '.\backup' -Session $session -Re
 **Example 3: Repair a broken session and receive files**
 
 ```powershell
-Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -Session $session -Credential $cred
+Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -Session $session
 ```
 
 ### `Wait-SshComputer`
@@ -175,7 +179,7 @@ Waits for a remote computer to complete a potential restart and ensures the SSH 
 
 ```powershell
 Invoke-Command -Session $session -ScriptBlock { Install-WindowsFeature AD-Domain-Services -Restart }
-Wait-SshComputer -Session $session -Credential $cred
+Wait-SshComputer -Session $session
 
 # $session is guaranteed working here, whether or not a restart occurred
 Invoke-SshCommand -Session $session -ScriptBlock { Get-WindowsFeature AD-Domain-Services }
@@ -187,7 +191,7 @@ Give 2 minutes for shutdown to begin, wait up to 15 minutes, and require 2 minut
 
 ```powershell
 Invoke-SshCommand -Session $session -ScriptBlock { Install-ADDSForest -DomainName 'corp.local' -Force }
-Wait-SshComputer -Session $session -Credential $cred -ShutdownGracePeriodSeconds 120 -WaitTimeoutSeconds 900 -StableForSeconds 120
+Wait-SshComputer -Session $session -Credential $domainCred -ShutdownGracePeriodSeconds 120 -WaitTimeoutSeconds 900 -StableForSeconds 120
 ```
 
 **Example 3: Quick check with short grace period**
@@ -200,7 +204,7 @@ Wait-SshComputer -Session $session -ShutdownGracePeriodSeconds 30 -StableForSeco
 | Parameter | Description |
 |-----------|-------------|
 | `-Session` | The existing `PSSession` to monitor. Repaired in-place if a restart is detected. |
-| `-Credential` | Optional credential for repairing the session. Required if the original session used password auth. |
+| `-Credential` | Optional credential override. If omitted, uses the credential stored on the session. |
 | `-ShutdownGracePeriodSeconds` | How long to monitor for a shutdown before assuming no restart occurred (default: 60). |
 | `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
 | `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
@@ -219,10 +223,10 @@ Restart-SshComputer -Session $session
 
 **Example 2: Restart with credentials**
 
-Since credentials cannot be extracted from an existing `PSSession`, pass them explicitly if the session uses password authentication.
+Since the credential is stored on the session, you typically don't need to pass it again. But you can override with a different credential if needed.
 
 ```powershell
-Restart-SshComputer -Session $session -Credential $cred
+Restart-SshComputer -Session $session -Credential $newCred
 ```
 
 **Example 3: Domain controller promotion (multiple reboots)**
@@ -230,7 +234,7 @@ Restart-SshComputer -Session $session -Credential $cred
 Wait up to 15 minutes for the server to come back, and require it to stay up for 2 minutes continuously before considering it stable.
 
 ```powershell
-Restart-SshComputer -Session $session -Credential $cred -StableForSeconds 120 -WaitTimeoutSeconds 900
+Restart-SshComputer -Session $session -Credential $domainCred -StableForSeconds 120 -WaitTimeoutSeconds 900
 ```
 
 **Example 4: Custom polling interval**
@@ -242,7 +246,7 @@ Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbose
 | Parameter | Description |
 |-----------|-------------|
 | `-Session` | The existing `PSSession` to restart. Repaired in-place after the restart. |
-| `-Credential` | Optional credential for repairing the session. Required if the original session used password auth. |
+| `-Credential` | Optional credential override. If omitted, uses the credential stored on the session. |
 | `-ShutdownGracePeriodSeconds` | How long to monitor for a shutdown after sending the restart command (default: 120). |
 | `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
 | `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
@@ -260,32 +264,39 @@ The following parameters are available on `New-SshSession`, `Invoke-SshCommand`,
 
 ## Session Repair
 
-All functions that accept a `-Session` parameter also support session repair. When you pass `-Session` together with `-Credential`, the function will create a fresh replacement session using the connection details from the old session. This is useful when a session has broken due to a network interruption, timeout, or server restart.
+All functions that accept a `-Session` parameter also support session repair. When you create a session with `-Credential`, the credential is stored on the session object so that any function can automatically repair a broken session without requiring the credential to be passed again.
 
-For `Invoke-SshCommand`, `Send-SshFile`, `Receive-SshFile`, `Wait-SshComputer`, and `Restart-SshComputer`, the repair happens **in-place** â€” the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
+You can always override the stored credential by passing `-Credential` explicitly. The override credential replaces the stored one for future repairs, which is useful when credentials change after a reboot (e.g. domain controller promotion).
+
+For `Invoke-SshCommand`, `Send-SshFile`, `Receive-SshFile`, `Wait-SshComputer`, and `Restart-SshComputer`, the repair happens **in-place** -- the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
 
 ```powershell
-# Session broke after a reboot? These just work â€” $session is repaired in-place:
-Invoke-SshCommand -Session $session -Credential $cred -ScriptBlock { Get-Date }
-Send-SshFile -Path .\file.txt -Destination /tmp/ -Session $session -Credential $cred
-Receive-SshFile -Path /tmp/file.txt -Destination .\ -Session $session -Credential $cred
+# Create a session with credentials -- the credential is stored automatically
+$session = New-SshSession -ComputerName server01 -Credential $cred
 
-# $session is now working again â€” no reassignment needed!
-Invoke-SshCommand -Session $session -ScriptBlock { hostname }
+# Session broke after a reboot? These just work -- no need to pass $cred again:
+Invoke-SshCommand -Session $session -ScriptBlock { Get-Date }
+Send-SshFile -Path .\file.txt -Destination /tmp/ -Session $session
+Receive-SshFile -Path /tmp/file.txt -Destination .\ -Session $session
+
+# Override with a different credential if needed (e.g. after domain join):
+Invoke-SshCommand -Session $session -Credential $domainCred -ScriptBlock { whoami }
+# $session now stores $domainCred for future repairs
 ```
 
 `Wait-SshComputer` is especially useful as a standalone checkpoint after running commands that might trigger a restart:
 
 ```powershell
 Invoke-Command -Session $session -ScriptBlock { Install-WindowsFeature ADDS -Restart }
-Wait-SshComputer -Session $session -Credential $cred
-# $session is working again - no reassignment needed!
+Wait-SshComputer -Session $session
+# $session is working again -- no reassignment or credential needed!
 ```
 
 For `New-SshSession -Session`, a new session object is returned (assign it back to your variable):
 
 ```powershell
-$session = New-SshSession -Session $session -Credential $cred
+$session = New-SshSession -Session $session
+# Stored credential is carried over automatically
 ```
 
 **Note on `Get-PSSession`**: The in-place repair uses reflection to transplant connection internals into the existing PSSession object. As a side effect, the repaired session will not appear in `Get-PSSession` output (the session registry still tracks the original entry). The session works correctly through the caller's variable, and all objects are cleaned up when the PowerShell process exits.

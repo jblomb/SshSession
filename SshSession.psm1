@@ -65,10 +65,17 @@ function Get-SshSessionInfo {
         $port = 22
     }
 
+    # Extract stored credential if present (attached by New-SshSession)
+    $credential = $null
+    if ($Session.PSObject.Properties['Credential']) {
+        $credential = $Session.Credential
+    }
+
     return @{
         ComputerName = $computerName
         UserName     = $userName
         Port         = $port
+        Credential   = $credential
     }
 }
 
@@ -130,6 +137,16 @@ function Copy-SshSession {
     }
 
     Write-Verbose "Refreshed session '$oldName' (Id: $oldId) with connection from session $($NewSession.Id)."
+
+    # Preserve stored credential (NoteProperty attached by New-SshSession)
+    if ($NewSession.PSObject.Properties['Credential']) {
+        if ($OldSession.PSObject.Properties['Credential']) {
+            $OldSession.Credential = $NewSession.Credential
+        }
+        else {
+            $OldSession | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $NewSession.Credential -Force
+        }
+    }
 }
 
 #endregion Private Functions
@@ -272,6 +289,10 @@ function New-SshSession {
         by configuring SSH_ASKPASS automatically. Returns a standard PSSession that works
         with all native PowerShell remoting cmdlets.
         
+        When a credential is provided, it is stored on the session object as a NoteProperty
+        so that other functions can automatically repair the session without requiring the
+        credential to be passed again.
+        
         By default, tests connectivity before creating the session to avoid hanging on
         unreachable hosts. Use -SkipTest to bypass this check.
         
@@ -284,8 +305,9 @@ function New-SshSession {
     
     .PARAMETER Session
         An existing PSSession to replace. Connection details (ComputerName, UserName, Port)
-        are extracted from the session. The old session is removed after the new one is created.
-        Provide -Credential if the original session used password-based authentication.
+        are extracted from the session. If the session has a stored credential and -Credential
+        is not provided, the stored credential is used automatically. The old session is
+        removed after the new one is created.
     
     .PARAMETER Credential
         Optional PSCredential object. If not specified, SSH will use default key-based authentication.
@@ -359,6 +381,12 @@ function New-SshSession {
             $Port = $info.Port
         }
 
+        # Fall back to stored credential if no explicit credential provided
+        if (-not $Credential -and $info.Credential) {
+            $Credential = $info.Credential
+            Write-Verbose "Using stored credential from session for '$ComputerName'."
+        }
+
         if (-not $Credential -and $info.UserName) {
             $UserName = $info.UserName
         }
@@ -426,7 +454,9 @@ function New-SshSession {
 
         try {
             Set-SshAskpassEnvironment -Credential $Credential
-            New-PSSession @sessionParams
+            $newSession = New-PSSession @sessionParams
+            $newSession | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
+            $newSession
         }
         finally {
             Remove-SshAskpassEnvironment
@@ -451,9 +481,10 @@ function Invoke-SshCommand {
         creates an ephemeral session for the command.
         
         When -Session is the only connection parameter, the existing session is used directly
-        for command execution. When combined with -Credential, the session is repaired first
-        if it is not in the 'Opened' state. The repair updates the caller's session variable
-        in-place using reflection, so it remains usable after the command completes.
+        for command execution. If the session is broken and has a stored credential (or an
+        explicit -Credential is provided), it is repaired in-place automatically. The repair
+        updates the caller's session variable via reflection, so it remains usable after the
+        command completes.
     
     .PARAMETER ComputerName
         The hostname or IP address of the remote computer. Required if Session is not provided.
@@ -533,17 +564,28 @@ function Invoke-SshCommand {
 
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
-            if ($Credential -and $Session.State -ne 'Opened') {
-                # Repair the broken session in-place with new credentials
+            # Resolve credential: explicit parameter > stored on session
+            $effectiveCredential = if ($Credential) { $Credential }
+                elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
+                else { $null }
+
+            if ($effectiveCredential -and $Session.State -ne 'Opened') {
+                # Repair the broken session in-place
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before invoking command."
                 $repairParams = @{
                     Session            = $Session
-                    Credential         = $Credential
+                    Credential         = $effectiveCredential
                     SkipTest           = $SkipTest
                     TestTimeoutSeconds = $TestTimeoutSeconds
                 }
                 $repairedSession = New-SshSession @repairParams
                 Copy-SshSession -OldSession $Session -NewSession $repairedSession
+
+                # Update stored credential if an explicit override was provided
+                if ($Credential) {
+                    $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
+                }
+
                 $invokeParams['Session'] = $Session
             }
             else {
@@ -685,16 +727,27 @@ function Send-SshFile {
 
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
-            if ($Credential -and $Session.State -ne 'Opened') {
+            # Resolve credential: explicit parameter > stored on session
+            $effectiveCredential = if ($Credential) { $Credential }
+                elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
+                else { $null }
+
+            if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before sending files."
                 $repairParams = @{
                     Session            = $Session
-                    Credential         = $Credential
+                    Credential         = $effectiveCredential
                     SkipTest           = $SkipTest
                     TestTimeoutSeconds = $TestTimeoutSeconds
                 }
                 $repairedSession = New-SshSession @repairParams
                 Copy-SshSession -OldSession $Session -NewSession $repairedSession
+
+                # Update stored credential if an explicit override was provided
+                if ($Credential) {
+                    $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
+                }
+
                 $copyParams['ToSession'] = $Session
             }
             else {
@@ -836,16 +889,27 @@ function Receive-SshFile {
 
     try {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
-            if ($Credential -and $Session.State -ne 'Opened') {
+            # Resolve credential: explicit parameter > stored on session
+            $effectiveCredential = if ($Credential) { $Credential }
+                elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
+                else { $null }
+
+            if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before receiving files."
                 $repairParams = @{
                     Session            = $Session
-                    Credential         = $Credential
+                    Credential         = $effectiveCredential
                     SkipTest           = $SkipTest
                     TestTimeoutSeconds = $TestTimeoutSeconds
                 }
                 $repairedSession = New-SshSession @repairParams
                 Copy-SshSession -OldSession $Session -NewSession $repairedSession
+
+                # Update stored credential if an explicit override was provided
+                if ($Credential) {
+                    $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
+                }
+
                 $copyParams['FromSession'] = $Session
             }
             else {
@@ -910,9 +974,11 @@ function Wait-SshComputer {
         in-place so the caller's variable remains usable without reassignment.
     
     .PARAMETER Credential
-        Optional PSCredential for repairing the session after a restart. Required if the
-        original session used password-based authentication. If omitted and a restart occurs,
-        key-based authentication is attempted using the username from the original session.
+        Optional PSCredential for repairing the session after a restart. If omitted, the
+        credential stored on the session (from New-SshSession) is used automatically.
+        If neither is available, key-based authentication is attempted using the username
+        from the original session. When provided explicitly, this credential also replaces
+        the stored credential on the session for future repairs.
     
     .PARAMETER ShutdownGracePeriodSeconds
         How long to monitor the connection for a shutdown. If the server has not stopped
@@ -978,6 +1044,12 @@ function Wait-SshComputer {
     $info = Get-SshSessionInfo -Session $Session
     $computerName = $info.ComputerName
     $userName = $info.UserName
+
+    # Resolve credential: explicit parameter > stored on session
+    if (-not $Credential -and $info.Credential) {
+        $Credential = $info.Credential
+        Write-Verbose "Using stored credential from session for '$computerName'."
+    }
 
     if (-not $PSBoundParameters.ContainsKey('Port')) {
         $Port = $info.Port
@@ -1082,6 +1154,11 @@ function Wait-SshComputer {
     $newSession = New-SshSession @newSessionParams
     Copy-SshSession -OldSession $Session -NewSession $newSession
 
+    # Update stored credential if an explicit override was provided
+    if ($PSBoundParameters.ContainsKey('Credential')) {
+        $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $PSBoundParameters['Credential'] -Force
+    }
+
     Write-Verbose "Session to '$computerName' repaired successfully."
 }
 
@@ -1105,10 +1182,10 @@ function Restart-SshComputer {
         restart command and will be repaired in-place after the restart completes.
     
     .PARAMETER Credential
-        Optional PSCredential for repairing the session after restart. Since credentials
-        cannot be extracted from an existing PSSession, you must provide this if the original
-        session used password-based authentication. If omitted, key-based authentication is
-        used with the username from the original session.
+        Optional PSCredential for repairing the session after restart. If omitted, the
+        credential stored on the session (from New-SshSession) is used automatically.
+        If neither is available, key-based authentication is used with the username from
+        the original session.
     
     .PARAMETER ShutdownGracePeriodSeconds
         Maximum seconds to wait for the server to go down after sending the restart command.
@@ -1173,6 +1250,12 @@ function Restart-SshComputer {
     )
 
     $computerName = $Session.ComputerName
+
+    # Resolve credential: explicit parameter > stored on session
+    if (-not $Credential -and $Session.PSObject.Properties['Credential']) {
+        $Credential = $Session.Credential
+        Write-Verbose "Using stored credential from session for '$computerName'."
+    }
 
     Write-Verbose "Restarting '$computerName'."
 

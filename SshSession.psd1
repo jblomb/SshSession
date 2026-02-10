@@ -1,11 +1,11 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.6.0'
+    ModuleVersion     = '1.7.0'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Blomman'
     CompanyName       = 'Unknown'
     Copyright         = '(c) 2025. All rights reserved.'
-    Description       = 'Enables PSCredential-based authentication for SSH remoting in PowerShell 7. Wraps New-PSSession, Invoke-Command, and Copy-Item with SSH_ASKPASS support. Includes connectivity testing with timeout protection.'
+    Description       = 'Enables PSCredential-based authentication for SSH remoting in PowerShell 7. Wraps New-PSSession, Invoke-Command, and Copy-Item with SSH_ASKPASS support. Includes connectivity testing with timeout protection. Credentials are stored on session objects for automatic repair.'
     PowerShellVersion = '7.0'
     
     FunctionsToExport = @(
@@ -28,6 +28,14 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.7.0
+- Credential is now stored on the PSSession object as a NoteProperty when created with New-SshSession -Credential
+- All functions that accept -Session automatically use the stored credential for repair when no explicit -Credential is provided
+- Explicit -Credential always takes priority over the stored credential (supports credential changes after reboot)
+- Explicit -Credential updates the stored credential on the session for future repairs
+- Copy-SshSession preserves the stored credential when transplanting session internals
+- Wait-SshComputer and Restart-SshComputer no longer require -Credential if the session was created with one
+
 1.6.0
 - Added Wait-SshComputer for waiting on potential restarts and repairing sessions in-place
 - Monitors a shutdown grace period to detect if the server goes down, then waits for online with optional stability check
