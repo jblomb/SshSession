@@ -499,7 +499,7 @@ function Invoke-SshCommand {
         Optional PSCredential for authentication. Creates an ephemeral session if Session is not provided.
     
     .PARAMETER ScriptBlock
-        The script block to execute on the remote computer.
+        (Alias: Command) The script block to execute on the remote computer.
     
     .PARAMETER ArgumentList
         Arguments to pass to the script block.
@@ -536,6 +536,7 @@ function Invoke-SshCommand {
         [PSCredential]$Credential,
 
         [Parameter(Mandatory, Position = 1)]
+        [Alias('Command')]
         [scriptblock]$ScriptBlock,
 
         [Parameter()]
@@ -1435,7 +1436,7 @@ function Enter-SshConsole {
         if ($Shell -eq 'pwsh' -or $Shell -eq 'powershell') {
             # Set a prompt function that mimics Enter-PSSession's [hostname]: PS path> format
             # Use -EncodedCommand to avoid escaping issues across shell layers
-            $promptScript = 'function prompt { "[" + $env:COMPUTERNAME.ToLower() + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
+            $promptScript = 'function prompt { "[" + $env:COMPUTERNAME + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
             $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($promptScript))
             $sshArgs += $Shell, '-NoExit', '-e', $encodedCommand
         }
