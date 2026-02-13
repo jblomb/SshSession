@@ -1436,7 +1436,7 @@ function Enter-SshConsole {
         if ($Shell -eq 'pwsh' -or $Shell -eq 'powershell') {
             # Set a prompt function that mimics Enter-PSSession's [hostname]: PS path> format
             # Use -EncodedCommand to avoid escaping issues across shell layers
-            $promptScript = 'function prompt { "[" + $env:COMPUTERNAME + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
+            $promptScript = 'function prompt { "[" + $env:COMPUTERNAME.ToLower() + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
             $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($promptScript))
             $sshArgs += $Shell, '-NoExit', '-e', $encodedCommand
         }
