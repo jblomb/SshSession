@@ -1,11 +1,11 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.7.0'
+    ModuleVersion     = '1.8.0'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Blomman'
     CompanyName       = 'Unknown'
     Copyright         = '(c) 2025. All rights reserved.'
-    Description       = 'Enables PSCredential-based authentication for SSH remoting in PowerShell 7. Wraps New-PSSession, Invoke-Command, and Copy-Item with SSH_ASKPASS support. Includes connectivity testing with timeout protection. Credentials are stored on session objects for automatic repair.'
+    Description       = 'Enables PSCredential-based authentication for SSH remoting in PowerShell 7. Wraps New-PSSession, Invoke-Command, and Copy-Item with SSH_ASKPASS support. Includes connectivity testing with timeout protection, interactive SSH console for full terminal support, and credentials stored on session objects for automatic repair.'
     PowerShellVersion = '7.0'
     
     FunctionsToExport = @(
@@ -16,6 +16,7 @@
         'Receive-SshFile'
         'Wait-SshComputer'
         'Restart-SshComputer'
+        'Enter-SshConsole'
     )
     
     CmdletsToExport   = @()
@@ -28,6 +29,16 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.8.0
+- Added Enter-SshConsole for interactive SSH console sessions using ssh.exe directly
+- Provides a proper terminal that supports interactive programs (edit.exe, vi, top, etc.)
+- Defaults to pwsh as remote shell to match PSSession behavior
+- Shows [hostname]: PS path> prompt for pwsh/powershell shells, matching Enter-PSSession
+- Supports -Shell parameter to select remote shell: pwsh, powershell, cmd, bash, or Default
+- Accepts the same connection parameters as New-SshSession (ComputerName, Credential, UserName, Port, Options)
+- Supports -Session parameter to extract connection details from an existing PSSession
+- Uses SSH_ASKPASS for credential-based authentication, consistent with the rest of the module
+
 1.7.0
 - Credential is now stored on the PSSession object as a NoteProperty when created with New-SshSession -Credential
 - All functions that accept -Session automatically use the stored credential for repair when no explicit -Credential is provided

@@ -1296,6 +1296,170 @@ function Restart-SshComputer {
     Write-Verbose "Restart of '$computerName' completed. Session is ready."
 }
 
+function Enter-SshConsole {
+    <#
+    .SYNOPSIS
+        Opens an interactive SSH console to a remote computer.
+    
+    .DESCRIPTION
+        Launches ssh.exe directly for a fully interactive terminal session. Unlike
+        Enter-PSSession, this provides a proper console that supports interactive
+        programs like edit.exe, vi, top, etc.
+        
+        Supports the same credential and connection parameters as New-SshSession.
+        When a PSCredential is provided, the SSH_ASKPASS mechanism is used for
+        password authentication.
+    
+    .PARAMETER ComputerName
+        The hostname or IP address of the remote computer.
+    
+    .PARAMETER Session
+        An existing PSSession to extract connection details from (ComputerName,
+        UserName, Port, stored Credential). The session itself is not used for
+        the connection -- ssh.exe connects independently.
+    
+    .PARAMETER Credential
+        Optional PSCredential object for password-based authentication.
+    
+    .PARAMETER UserName
+        Optional username for key-based authentication. Ignored if Credential is provided.
+    
+    .PARAMETER Port
+        SSH port. Defaults to 22, or the port from the session when using -Session.
+    
+    .PARAMETER Shell
+        The remote shell to launch. Defaults to 'pwsh' to match PSSession behavior.
+        Valid values: pwsh, powershell, cmd, bash, Default.
+        Use 'Default' to use the server's default login shell.
+    
+    .PARAMETER Options
+        Additional SSH options as a hashtable, passed as -o Key=Value arguments.
+    
+    .EXAMPLE
+        Enter-SshConsole -ComputerName server01 -Credential $cred
+        # Opens an interactive SSH session with pwsh as the remote shell
+    
+    .EXAMPLE
+        Enter-SshConsole -ComputerName server01 -Credential $cred -Shell bash
+        # Opens an interactive SSH session with bash as the remote shell
+    
+    .EXAMPLE
+        Enter-SshConsole -ComputerName server01 -Credential $cred -Shell Default
+        # Opens an interactive SSH session with the server's default login shell
+    
+    .EXAMPLE
+        Enter-SshConsole -ComputerName server01 -UserName admin
+        # Opens an interactive SSH session with key-based authentication
+    
+    .EXAMPLE
+        Enter-SshConsole -Session $session
+        # Uses connection details (and stored credential) from an existing PSSession
+    
+    .EXAMPLE
+        Enter-SshConsole -ComputerName server01 -Credential $cred -Options @{ ProxyJump = 'bastion01' }
+        # Connects through a bastion host
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'ComputerName')]
+    param(
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'ComputerName')]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Session')]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter(ParameterSetName = 'ComputerName')]
+        [string]$UserName,
+
+        [Parameter()]
+        [int]$Port,
+
+        [Parameter()]
+        [ValidateSet('pwsh', 'powershell', 'cmd', 'bash', 'Default')]
+        [string]$Shell = 'pwsh',
+
+        [Parameter()]
+        [hashtable]$Options
+    )
+
+    # If Session is provided, extract connection info
+    if ($PSCmdlet.ParameterSetName -eq 'Session') {
+        $info = Get-SshSessionInfo -Session $Session
+        $ComputerName = $info.ComputerName
+
+        if (-not $PSBoundParameters.ContainsKey('Port')) {
+            $Port = $info.Port
+        }
+
+        if (-not $Credential -and $info.Credential) {
+            $Credential = $info.Credential
+            Write-Verbose "Using stored credential from session for '$ComputerName'."
+        }
+
+        if (-not $Credential -and -not $UserName -and $info.UserName) {
+            $UserName = $info.UserName
+        }
+    }
+
+    # Default port
+    if (-not $PSBoundParameters.ContainsKey('Port') -and $PSCmdlet.ParameterSetName -ne 'Session') {
+        $Port = 22
+    }
+
+    # Build SSH arguments
+    $sshArgs = @('-o', 'StrictHostKeyChecking=no', '-p', $Port)
+
+    if ($Credential) {
+        $sshArgs += '-o', 'PreferredAuthentications=password'
+        $sshArgs += '-o', 'PubkeyAuthentication=no'
+    }
+
+    # Add user-provided options
+    if ($Options) {
+        foreach ($key in $Options.Keys) {
+            $sshArgs += '-o', "$key=$($Options[$key])"
+        }
+    }
+
+    # Build target
+    $effectiveUserName = if ($Credential) { $Credential.UserName } elseif ($UserName) { $UserName } else { $null }
+    $sshTarget = if ($effectiveUserName) { "$effectiveUserName@$ComputerName" } else { $ComputerName }
+    $sshArgs += $sshTarget
+
+    # When a specific shell is requested, force TTY allocation and append the shell command
+    if ($Shell -ne 'Default') {
+        $sshArgs += '-t'
+
+        if ($Shell -eq 'pwsh' -or $Shell -eq 'powershell') {
+            # Set a prompt function that mimics Enter-PSSession's [hostname]: PS path> format
+            # Use -EncodedCommand to avoid escaping issues across shell layers
+            $promptScript = 'function prompt { "[" + $env:COMPUTERNAME.ToLower() + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
+            $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($promptScript))
+            $sshArgs += $Shell, '-NoExit', '-e', $encodedCommand
+        }
+        else {
+            $sshArgs += $Shell
+        }
+    }
+
+    Write-Verbose "Launching: ssh $($sshArgs -join ' ')"
+
+    try {
+        if ($Credential) {
+            Set-SshAskpassEnvironment -Credential $Credential
+        }
+
+        & ssh @sshArgs
+    }
+    finally {
+        if ($Credential) {
+            Remove-SshAskpassEnvironment
+        }
+    }
+}
+
 #endregion Public Functions
 
-Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile, Wait-SshComputer, Restart-SshComputer
+Export-ModuleMember -Function Test-SshConnection, New-SshSession, Invoke-SshCommand, Send-SshFile, Receive-SshFile, Wait-SshComputer, Restart-SshComputer, Enter-SshConsole

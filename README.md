@@ -8,6 +8,7 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 - **Connection Testing with Timeout**: Automatically tests connectivity before creating sessions to avoid hanging on unreachable hosts.
 - **Session Repair**: Credentials are stored on the session object, enabling automatic repair of broken sessions without re-providing credentials. All functions handle this transparently.
 - **Restart & Wait**: Restart remote computers and wait for them to come back online, or use `Wait-SshComputer` as a standalone checkpoint after commands that might trigger a reboot.
+- **Interactive Console**: Launch a native `ssh.exe` console for full terminal support with programs like `edit.exe`, `vi`, or `top` that don't work through `Enter-PSSession`.
 - **Persistent and Ephemeral Sessions**: Create and manage persistent `PSSession` objects or use one-liner commands for quick, ephemeral operations.
 - **Familiar Syntax**: Works like native PowerShell Remoting (`*-PSSession`, `Invoke-Command`, `Copy-Item`).
 - **File Transfer Support**: Easily send and receive files and directories to and from remote systems over SSH.
@@ -252,6 +253,62 @@ Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbose
 | `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
 | `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
 | `-Port` | SSH port. Defaults to the port from the original session. |
+
+### `Enter-SshConsole`
+
+Opens an interactive SSH console using `ssh.exe` directly. Unlike `Enter-PSSession`, this provides a proper terminal that supports interactive programs like `edit.exe`, `vi`, `top`, etc.
+
+By default, launches `pwsh` on the remote side to match `Enter-PSSession` behavior, including the `[hostname]: PS path>` prompt style. Use `-Shell` to select a different shell, or `-Shell Default` to use the server's default login shell.
+
+Accepts the same connection parameters as `New-SshSession`. Can also extract connection details from an existing `PSSession` via `-Session`.
+
+**Example 1: Connect with credentials (launches pwsh by default)**
+
+```powershell
+Enter-SshConsole -ComputerName 'server.example.com' -Credential $cred
+```
+
+**Example 2: Connect with bash**
+
+```powershell
+Enter-SshConsole -ComputerName 'server.example.com' -Credential $cred -Shell bash
+```
+
+**Example 3: Use the server's default login shell**
+
+```powershell
+Enter-SshConsole -ComputerName 'server.example.com' -Credential $cred -Shell Default
+```
+
+**Example 4: Connect with key-based authentication**
+
+```powershell
+Enter-SshConsole -ComputerName 'server.example.com' -UserName 'admin'
+```
+
+**Example 5: Use connection details from an existing session**
+
+```powershell
+$session = New-SshSession -ComputerName 'server.example.com' -Credential $cred
+# Later, need a real console for interactive editing:
+Enter-SshConsole -Session $session
+```
+
+**Example 6: Connect through a bastion host**
+
+```powershell
+Enter-SshConsole -ComputerName 'server.example.com' -Credential $cred -Options @{ ProxyJump = 'bastion01' }
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `-ComputerName` | The hostname or IP address of the remote computer. |
+| `-Session` | An existing `PSSession` to extract connection details from. The session itself is not used. |
+| `-Credential` | Optional credential for password-based authentication. |
+| `-UserName` | Optional username for key-based authentication. |
+| `-Port` | SSH port. Defaults to 22, or the port from the session. |
+| `-Shell` | Remote shell to launch: `pwsh` (default), `powershell`, `cmd`, `bash`, or `Default` (server's login shell). |
+| `-Options` | Additional SSH options as a hashtable, passed as `-o Key=Value` arguments. |
 
 ## Common Parameters
 
