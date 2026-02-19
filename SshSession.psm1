@@ -441,7 +441,7 @@ function New-SshSession {
             PreferredAuthentications = 'password'
             PubkeyAuthentication     = 'no'
         }
-        
+
         # Merge with any user-provided options (user options take precedence)
         if ($sessionParams['Options']) {
             foreach ($key in $sshOptions.Keys) {
@@ -456,6 +456,7 @@ function New-SshSession {
 
         try {
             Set-SshAskpassEnvironment -Credential $Credential
+
             $newSession = New-PSSession @sessionParams
             $newSession | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
             $newSession
@@ -569,8 +570,8 @@ function Invoke-SshCommand {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
             # Resolve credential: explicit parameter > stored on session
             $effectiveCredential = if ($Credential) { $Credential }
-                elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
-                else { $null }
+            elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
+            else { $null }
 
             if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 # Repair the broken session in-place
@@ -732,8 +733,8 @@ function Send-SshFile {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
             # Resolve credential: explicit parameter > stored on session
             $effectiveCredential = if ($Credential) { $Credential }
-                elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
-                else { $null }
+            elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
+            else { $null }
 
             if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before sending files."
@@ -894,8 +895,8 @@ function Receive-SshFile {
         if ($PSCmdlet.ParameterSetName -eq 'Session') {
             # Resolve credential: explicit parameter > stored on session
             $effectiveCredential = if ($Credential) { $Credential }
-                elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
-                else { $null }
+            elseif ($Session.PSObject.Properties['Credential']) { $Session.Credential }
+            else { $null }
 
             if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before receiving files."
@@ -1040,6 +1041,9 @@ function Wait-SshComputer {
         [int]$PollIntervalSeconds = 5,
 
         [Parameter()]
+        [int]$SshConnectionTimeoutSeconds = 15,
+
+        [Parameter()]
         [int]$Port
     )
 
@@ -1064,7 +1068,7 @@ function Wait-SshComputer {
     $testParams = @{
         ComputerName   = $computerName
         Port           = $Port
-        TimeoutSeconds = [Math]::Min(10, $PollIntervalSeconds)
+        TimeoutSeconds = [Math]::Min(10, $SshConnectionTimeoutSeconds)
     }
 
     if ($Credential) {
@@ -1082,6 +1086,12 @@ function Wait-SshComputer {
             $serverWentDown = $true
             Write-Verbose "Server '$computerName' is no longer responding. Restart detected."
             break
+        }
+        if ($Session.Status -ne 'Opened') {
+            $serverWentDown = $true
+            Write-Verbose "Session is broken. Restart detected."
+            break
+
         }
         Write-Verbose "Server '$computerName' still responding, monitoring for shutdown..."
         Start-Sleep -Seconds $PollIntervalSeconds
@@ -1277,11 +1287,12 @@ function Restart-SshComputer {
 
     # --- Wait for restart and repair session in-place ---
     $waitParams = @{
-        Session                    = $Session
-        ShutdownGracePeriodSeconds = $ShutdownGracePeriodSeconds
-        WaitTimeoutSeconds         = $WaitTimeoutSeconds
-        StableForSeconds           = $StableForSeconds
-        PollIntervalSeconds        = $PollIntervalSeconds
+        Session                     = $Session
+        ShutdownGracePeriodSeconds  = $ShutdownGracePeriodSeconds
+        WaitTimeoutSeconds          = $WaitTimeoutSeconds
+        StableForSeconds            = $StableForSeconds
+        PollIntervalSeconds         = $PollIntervalSeconds
+        SshConnectionTimeoutSeconds = 20
     }
 
     if ($Credential) {
@@ -1436,7 +1447,7 @@ function Enter-SshConsole {
         if ($Shell -eq 'pwsh' -or $Shell -eq 'powershell') {
             # Set a prompt function that mimics Enter-PSSession's [hostname]: PS path> format
             # Use -EncodedCommand to avoid escaping issues across shell layers
-            $promptScript = 'function prompt { "[" + $env:COMPUTERNAME.ToLower() + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
+            $promptScript = 'if ($PSVersionTable.PSVersion.Major -eq 5) { Write-Host "Windows PowerShell $($PSVersionTable.PSVersion.ToString())`n" } else { Write-Host "PowerShell $($PSVersionTable.PSVersion.ToString())`n" }; function prompt { "[" + $env:COMPUTERNAME.ToLower() + "]: PS " + $executionContext.SessionState.Path.CurrentLocation + (">" * ($nestedPromptLevel + 1)) + " " }'
             $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($promptScript))
             $sshArgs += $Shell, '-NoExit', '-e', $encodedCommand
         }
