@@ -157,11 +157,9 @@ function Repair-SshSession {
         its internals into the existing session object via Copy-SshSession. Optionally
         updates the stored credential on the session.
 
-        Returns $true if a repair was performed, $false if no repair was needed.
         Throws if the repair itself fails (e.g. the server is unreachable).
     #>
     [CmdletBinding()]
-    [OutputType([bool])]
     param(
         [Parameter(Mandatory)]
         [System.Management.Automation.Runspaces.PSSession]$Session,
@@ -193,8 +191,6 @@ function Repair-SshSession {
     if ($ExplicitCredential) {
         $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $ExplicitCredential -Force
     }
-
-    return $true
 }
 
 #endregion Private Functions

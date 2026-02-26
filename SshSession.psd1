@@ -1,9 +1,9 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.9.1'
+    ModuleVersion     = '1.9.2'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
-    Author            = 'Blomman'
-    CompanyName       = 'Unknown'
+    Author            = 'Jan Blomberg'
+    CompanyName       = ''
     Copyright         = '(c) 2025. All rights reserved.'
     Description       = 'Enables PSCredential-based authentication for SSH remoting in PowerShell 7. Wraps New-PSSession, Invoke-Command, and Copy-Item with SSH_ASKPASS support. Includes connectivity testing with timeout protection, interactive SSH console for full terminal support, and credentials stored on session objects for automatic repair.'
     PowerShellVersion = '7.0'
@@ -29,9 +29,13 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.9.2
+- Fixed: Repair-SshSession no longer returns $true to the output stream, which was leaking into command results during transport retry
+
 1.9.1
 - Fixed: New-SshSession now clones the user-provided -Options hashtable before merging credential auth options
 - Previously, passing a shared hashtable to multiple calls would have PreferredAuthentications and PubkeyAuthentication permanently added to the caller's variable
+- Fixed: Repair-SshSession no longer returns $true to the output stream, which was leaking into command results during transport retry repairs
 
 1.9.0
 - Invoke-SshCommand, Send-SshFile, and Receive-SshFile now automatically retry on transport failures
