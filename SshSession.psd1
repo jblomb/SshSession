@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.8.0'
+    ModuleVersion     = '1.9.1'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Blomman'
     CompanyName       = 'Unknown'
@@ -29,6 +29,17 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.9.1
+- Fixed: New-SshSession now clones the user-provided -Options hashtable before merging credential auth options
+- Previously, passing a shared hashtable to multiple calls would have PreferredAuthentications and PubkeyAuthentication permanently added to the caller's variable
+
+1.9.0
+- Invoke-SshCommand, Send-SshFile, and Receive-SshFile now automatically retry on transport failures
+- Sessions that report 'Opened' but have a dead transport (e.g. after an unexpected server restart) are repaired and retried once
+- Only PSRemotingTransportException triggers a retry; non-transport errors (real command/script failures) propagate immediately
+- Added private Repair-SshSession helper to consolidate in-place session repair logic across all functions
+- Existing pre-repair for visibly broken sessions (State -ne 'Opened') is preserved as an optimistic fast path
+
 1.8.0
 - Added Enter-SshConsole for interactive SSH console sessions using ssh.exe directly
 - Provides a proper terminal that supports interactive programs (edit.exe, vi, top, etc.)

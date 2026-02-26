@@ -327,6 +327,11 @@ You can always override the stored credential by passing `-Credential` explicitl
 
 For `Invoke-SshCommand`, `Send-SshFile`, `Receive-SshFile`, `Wait-SshComputer`, and `Restart-SshComputer`, the repair happens **in-place** -- the caller's `$session` variable is updated transparently via reflection so it remains usable after the operation completes. No reassignment is needed.
 
+Repair is triggered in two situations:
+
+1. **Visibly broken sessions**: If the session's `State` is not `Opened` (e.g. `Broken`, `Disconnected`), the session is repaired proactively before the operation runs.
+2. **Stale sessions**: If the session reports `Opened` but the underlying transport is dead (e.g. the server restarted unexpectedly), the operation will fail with a `PSRemotingTransportException`. When this happens, the session is repaired in-place and the operation is retried exactly once. Non-transport errors (real command failures, file-not-found, etc.) are never retried.
+
 ```powershell
 # Create a session with credentials -- the credential is stored automatically
 $session = New-SshSession -ComputerName server01 -Credential $cred
@@ -370,3 +375,35 @@ This module simplifies password-based authentication with SSH by leveraging the 
 This allows `New-PSSession` to authenticate with a password without requiring interactive input, making it suitable for automation and scripting. Key-based authentication remains the default if no credential is provided.
 
 When credentials are provided, the module forces password-only authentication (`PreferredAuthentications=password`, `PubkeyAuthentication=no`) to prevent SSH from falling back to key-based authentication if the password is incorrect.
+
+## Requirements
+
+- **PowerShell 7.0 or later** on the local machine.
+- **PowerShell 7 (pwsh)** must be installed and available on the remote host. All session-based functions (`New-SshSession`, `Test-SshConnection`, etc.) rely on the PowerShell SSH subsystem, which requires `pwsh` on the remote end. `Test-SshConnection` validates this by running a `pwsh` command over SSH, so a successful test confirms that session creation will work.
+- **ssh.exe** must be available in the system PATH.
+
+## Known Limitations
+
+### Not safe for parallel use with different credentials
+
+The module uses process-level environment variables (`SSH_ASKPASS`, `SSH_CREDENTIAL_PASSWORD`) to pass passwords to `ssh.exe`. This is an inherent requirement of the SSH_ASKPASS mechanism. If you use this module in a multi-threaded context (`ForEach-Object -Parallel`, runspace pools, or concurrent jobs) with **different credentials**, the environment variables from one thread can overwrite another's, causing authentication failures.
+
+This is safe:
+- Sequential operations with different credentials
+- Parallel operations that all use the **same** credential
+- Parallel operations using key-based authentication (no credential)
+
+This is **not** safe:
+- `ForEach-Object -Parallel` where each iteration connects with a different `PSCredential`
+
+### In-place repair relies on .NET reflection
+
+The `Copy-SshSession` function uses .NET reflection to transplant connection internals between `PSSession` objects. This depends on compiler-generated backing field names (e.g. `<Id>k__BackingField`) that have been stable across all PowerShell 7.x releases but could theoretically change in a future .NET or PowerShell version. If this happens, session repair will fail with verbose warnings about missing fields.
+
+### Repaired sessions accumulate in the session table
+
+When a session is repaired in-place, the new session created during repair cannot be safely removed from PowerShell's internal session table (doing so would destroy the runspace that the repaired session now uses). These hollow entries accumulate over the lifetime of the PowerShell process. For short-lived scripts or scripts with occasional repairs, this is negligible. For long-running automation that repairs sessions frequently, be aware of gradual memory growth. All entries are cleaned up when the PowerShell process exits.
+
+### Host key checking is disabled
+
+The module uses `-o StrictHostKeyChecking=no` for automation convenience. This means SSH will not verify the remote host's identity, which could be a concern in untrusted network environments. If you need strict host key verification, manage host keys through your SSH config file (`~/.ssh/config` or system-wide) and use `known_hosts` entries for your target servers.

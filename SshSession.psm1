@@ -151,6 +151,52 @@ function Copy-SshSession {
     }
 }
 
+function Repair-SshSession {
+    <#
+        Repairs a broken PSSession in-place by creating a new session and transplanting
+        its internals into the existing session object via Copy-SshSession. Optionally
+        updates the stored credential on the session.
+
+        Returns $true if a repair was performed, $false if no repair was needed.
+        Throws if the repair itself fails (e.g. the server is unreachable).
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.Runspaces.PSSession]$Session,
+
+        [Parameter(Mandatory)]
+        [PSCredential]$EffectiveCredential,
+
+        [Parameter()]
+        [PSCredential]$ExplicitCredential,
+
+        [Parameter()]
+        [switch]$SkipTest,
+
+        [Parameter()]
+        [int]$TestTimeoutSeconds = 30
+    )
+
+    Write-Verbose "Repairing session to '$($Session.ComputerName)' in-place."
+    $repairParams = @{
+        Session            = $Session
+        Credential         = $EffectiveCredential
+        SkipTest           = $SkipTest
+        TestTimeoutSeconds = $TestTimeoutSeconds
+    }
+    $repairedSession = New-SshSession @repairParams
+    Copy-SshSession -OldSession $Session -NewSession $repairedSession
+
+    # Update stored credential if an explicit override was provided
+    if ($ExplicitCredential) {
+        $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $ExplicitCredential -Force
+    }
+
+    return $true
+}
+
 #endregion Private Functions
 
 #region Public Functions
@@ -430,7 +476,7 @@ function New-SshSession {
     }
 
     if ($Options) {
-        $sessionParams['Options'] = $Options
+        $sessionParams['Options'] = $Options.Clone()
     }
 
     if ($Credential) {
@@ -484,17 +530,23 @@ function Invoke-SshCommand {
         creates an ephemeral session for the command.
         
         When -Session is the only connection parameter, the existing session is used directly
-        for command execution. If the session is broken and has a stored credential (or an
-        explicit -Credential is provided), it is repaired in-place automatically. The repair
-        updates the caller's session variable via reflection, so it remains usable after the
-        command completes.
+        for command execution. If the session is visibly broken (State is not 'Opened') and has
+        a stored credential (or an explicit -Credential is provided), it is repaired in-place
+        before the command runs. If the session appears healthy but fails with a transport error
+        (e.g. the server restarted but the session still reports 'Opened'), the session is
+        repaired in-place and the command is retried once automatically. Non-transport errors
+        are not retried as they indicate real command failures, not stale connections.
+        
+        The repair updates the caller's session variable via reflection, so it remains usable
+        after the command completes.
     
     .PARAMETER ComputerName
         The hostname or IP address of the remote computer. Required if Session is not provided.
     
     .PARAMETER Session
         An existing PSSession to use for command execution. When used alone, the session is
-        used as-is. When combined with -Credential, the session is repaired first.
+        used as-is. If a transport error occurs and credentials are available, the session is
+        repaired and the command retried automatically.
     
     .PARAMETER Credential
         Optional PSCredential for authentication. Creates an ephemeral session if Session is not provided.
@@ -574,27 +626,28 @@ function Invoke-SshCommand {
             else { $null }
 
             if ($effectiveCredential -and $Session.State -ne 'Opened') {
-                # Repair the broken session in-place
+                # Repair the session proactively when it is visibly broken
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before invoking command."
-                $repairParams = @{
-                    Session            = $Session
-                    Credential         = $effectiveCredential
-                    SkipTest           = $SkipTest
-                    TestTimeoutSeconds = $TestTimeoutSeconds
-                }
-                $repairedSession = New-SshSession @repairParams
-                Copy-SshSession -OldSession $Session -NewSession $repairedSession
-
-                # Update stored credential if an explicit override was provided
-                if ($Credential) {
-                    $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
-                }
-
-                $invokeParams['Session'] = $Session
+                Repair-SshSession -Session $Session -EffectiveCredential $effectiveCredential -ExplicitCredential $Credential -SkipTest:$SkipTest -TestTimeoutSeconds $TestTimeoutSeconds
             }
-            else {
-                $invokeParams['Session'] = $Session
-                Write-Verbose "Invoking command on existing session '$($Session.ComputerName)'."
+
+            $invokeParams['Session'] = $Session
+
+            try {
+                Invoke-Command @invokeParams
+            }
+            catch [System.Management.Automation.Remoting.PSRemotingTransportException] {
+                # Session appeared healthy but the transport is dead (e.g. server restarted
+                # while session still reported 'Opened'). Repair and retry once.
+                if ($effectiveCredential) {
+                    Write-Verbose "Transport error on session to '$($Session.ComputerName)': $_. Repairing in-place and retrying."
+                    Repair-SshSession -Session $Session -EffectiveCredential $effectiveCredential -ExplicitCredential $Credential -SkipTest:$SkipTest -TestTimeoutSeconds $TestTimeoutSeconds
+                    $invokeParams['Session'] = $Session
+                    Invoke-Command @invokeParams
+                }
+                else {
+                    throw
+                }
             }
         }
         else {
@@ -616,9 +669,8 @@ function Invoke-SshCommand {
 
             $ephemeralSession = New-SshSession @sessionParams
             $invokeParams['Session'] = $ephemeralSession
+            Invoke-Command @invokeParams
         }
-
-        Invoke-Command @invokeParams
     }
     finally {
         if ($ephemeralSession) {
@@ -635,6 +687,11 @@ function Send-SshFile {
     .DESCRIPTION
         Wraps Copy-Item -ToSession for SSH-based file transfers. Supports credential-based
         authentication for one-liner scenarios.
+        
+        When using an existing session, the function handles stale connections transparently.
+        If the session is visibly broken, it is repaired before the transfer. If the session
+        appears healthy but fails with a transport error, it is repaired and the transfer
+        retried once automatically. Non-transport errors are not retried.
     
     .PARAMETER Path
         Local path(s) of files or folders to send.
@@ -738,25 +795,24 @@ function Send-SshFile {
 
             if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before sending files."
-                $repairParams = @{
-                    Session            = $Session
-                    Credential         = $effectiveCredential
-                    SkipTest           = $SkipTest
-                    TestTimeoutSeconds = $TestTimeoutSeconds
-                }
-                $repairedSession = New-SshSession @repairParams
-                Copy-SshSession -OldSession $Session -NewSession $repairedSession
-
-                # Update stored credential if an explicit override was provided
-                if ($Credential) {
-                    $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
-                }
-
-                $copyParams['ToSession'] = $Session
+                Repair-SshSession -Session $Session -EffectiveCredential $effectiveCredential -ExplicitCredential $Credential -SkipTest:$SkipTest -TestTimeoutSeconds $TestTimeoutSeconds
             }
-            else {
-                $copyParams['ToSession'] = $Session
-                Write-Verbose "Sending file(s) to existing session '$($Session.ComputerName)'."
+
+            $copyParams['ToSession'] = $Session
+
+            try {
+                Copy-Item @copyParams
+            }
+            catch [System.Management.Automation.Remoting.PSRemotingTransportException] {
+                if ($effectiveCredential) {
+                    Write-Verbose "Transport error on session to '$($Session.ComputerName)': $_. Repairing in-place and retrying."
+                    Repair-SshSession -Session $Session -EffectiveCredential $effectiveCredential -ExplicitCredential $Credential -SkipTest:$SkipTest -TestTimeoutSeconds $TestTimeoutSeconds
+                    $copyParams['ToSession'] = $Session
+                    Copy-Item @copyParams
+                }
+                else {
+                    throw
+                }
             }
         }
         else {
@@ -778,9 +834,8 @@ function Send-SshFile {
 
             $ephemeralSession = New-SshSession @sessionParams
             $copyParams['ToSession'] = $ephemeralSession
+            Copy-Item @copyParams
         }
-
-        Copy-Item @copyParams
     }
     finally {
         if ($ephemeralSession) {
@@ -797,6 +852,11 @@ function Receive-SshFile {
     .DESCRIPTION
         Wraps Copy-Item -FromSession for SSH-based file transfers. Supports credential-based
         authentication for one-liner scenarios.
+        
+        When using an existing session, the function handles stale connections transparently.
+        If the session is visibly broken, it is repaired before the transfer. If the session
+        appears healthy but fails with a transport error, it is repaired and the transfer
+        retried once automatically. Non-transport errors are not retried.
     
     .PARAMETER Path
         Remote path(s) of files or folders to receive.
@@ -900,25 +960,24 @@ function Receive-SshFile {
 
             if ($effectiveCredential -and $Session.State -ne 'Opened') {
                 Write-Verbose "Session to '$($Session.ComputerName)' is in state '$($Session.State)'. Repairing in-place before receiving files."
-                $repairParams = @{
-                    Session            = $Session
-                    Credential         = $effectiveCredential
-                    SkipTest           = $SkipTest
-                    TestTimeoutSeconds = $TestTimeoutSeconds
-                }
-                $repairedSession = New-SshSession @repairParams
-                Copy-SshSession -OldSession $Session -NewSession $repairedSession
-
-                # Update stored credential if an explicit override was provided
-                if ($Credential) {
-                    $Session | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $Credential -Force
-                }
-
-                $copyParams['FromSession'] = $Session
+                Repair-SshSession -Session $Session -EffectiveCredential $effectiveCredential -ExplicitCredential $Credential -SkipTest:$SkipTest -TestTimeoutSeconds $TestTimeoutSeconds
             }
-            else {
-                $copyParams['FromSession'] = $Session
-                Write-Verbose "Receiving file(s) from existing session '$($Session.ComputerName)'."
+
+            $copyParams['FromSession'] = $Session
+
+            try {
+                Copy-Item @copyParams
+            }
+            catch [System.Management.Automation.Remoting.PSRemotingTransportException] {
+                if ($effectiveCredential) {
+                    Write-Verbose "Transport error on session to '$($Session.ComputerName)': $_. Repairing in-place and retrying."
+                    Repair-SshSession -Session $Session -EffectiveCredential $effectiveCredential -ExplicitCredential $Credential -SkipTest:$SkipTest -TestTimeoutSeconds $TestTimeoutSeconds
+                    $copyParams['FromSession'] = $Session
+                    Copy-Item @copyParams
+                }
+                else {
+                    throw
+                }
             }
         }
         else {
@@ -940,9 +999,8 @@ function Receive-SshFile {
 
             $ephemeralSession = New-SshSession @sessionParams
             $copyParams['FromSession'] = $ephemeralSession
+            Copy-Item @copyParams
         }
-
-        Copy-Item @copyParams
     }
     finally {
         if ($ephemeralSession) {
