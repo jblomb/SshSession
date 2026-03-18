@@ -36,7 +36,7 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 
 ### `Test-SshConnection`
 
-Tests SSH connectivity to a remote host with timeout protection. Returns `$true` if the connection succeeds, `$false` otherwise. Use `-Verbose` to see detailed failure information.
+Tests SSH connectivity to a remote host with timeout protection. Returns `$true` if the connection succeeds, `$false` otherwise. Failure reasons (timeouts, authentication errors, SSH errors) are shown as warnings automatically. Use `-Verbose` for additional diagnostic details like the SSH command being executed.
 
 **Example 1: Test connectivity before running commands**
 

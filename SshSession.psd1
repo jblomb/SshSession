@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.9.2'
+    ModuleVersion     = '1.9.3'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Jan Blomberg'
     CompanyName       = ''
@@ -29,6 +29,13 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+1.9.3
+- Improved: Test-SshConnection now uses Write-Warning instead of Write-Verbose for failure messages, making connection problems visible without -Verbose
+- Added Format-SshError helper inside Test-SshConnection for indented, readable error output
+- Fixed: SSH stderr (host key warnings, auth failures, etc.) is now captured and included in warning output via 2>&1
+- Changed result check from -eq to -contains to handle mixed stdout/stderr output arrays
+- Removed separate job failure state check in favor of unified result handling
+
 1.9.2
 - Fixed: Repair-SshSession no longer returns $true to the output stream, which was leaking into command results during transport retry
 
