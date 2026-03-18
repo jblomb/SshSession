@@ -256,6 +256,12 @@ function Test-SshConnection {
         [int]$Port = 22
     )
 
+    function Format-SshError {
+        param([string]$Message, [string]$Detail)
+        $indented = ($Detail.Trim() -split "`n" | ForEach-Object { "    $($_.Trim())" }) -join "`n"
+        return "$Message`n$indented"
+    }
+
     # Determine username for SSH target
     $effectiveUserName = if ($Credential) { $Credential.UserName } elseif ($UserName) { $UserName } else { $null }
     $sshTarget = if ($effectiveUserName) { "$effectiveUserName@$ComputerName" } else { $ComputerName }
@@ -287,29 +293,24 @@ function Test-SshConnection {
         $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
 
         if (-not $completed) {
-            Write-Verbose "SSH connection to '$ComputerName' timed out after $TimeoutSeconds seconds."
+            Write-Warning "SSH connection to '$ComputerName' timed out after $TimeoutSeconds seconds."
             return $false
         }
 
-        if ($job.State -eq 'Failed') {
-            $errorInfo = Receive-Job -Job $job -ErrorAction SilentlyContinue
-            Write-Verbose "SSH connection to '$ComputerName' failed: $errorInfo"
-            return $false
-        }
+        $result = Receive-Job -Job $job 2>&1
+        $resultText = ($result | Out-String).Trim()
 
-        $result = Receive-Job -Job $job
-
-        if ($result -eq 'OK!') {
+        if ($result -contains 'OK!') {
             Write-Verbose "SSH connection to '$ComputerName' succeeded."
             return $true
         }
         else {
-            Write-Verbose "SSH connection to '$ComputerName' failed. Unexpected response: $result"
+            Write-Warning (Format-SshError "SSH connection to '$ComputerName' failed:" $resultText)
             return $false
         }
     }
     catch {
-        Write-Verbose "SSH connection to '$ComputerName' failed: $_"
+        Write-Warning (Format-SshError "SSH connection to '$ComputerName' failed:" $_.Exception.Message)
         return $false
     }
     finally {
