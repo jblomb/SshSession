@@ -2,6 +2,8 @@
 
 SshSession is a PowerShell module that simplifies using PowerShell Remoting over SSH. It provides a set of wrapper functions around the native `*-PSSession` and `*-Item` cmdlets to enable seamless, credential-based authentication and easier command execution and file transfers.
 
+For implementation details and maintenance guidance, see [Architecture](docs/ARCHITECTURE.md).
+
 ## Features
 
 - **Simplified Credential Management**: Use `PSCredential` objects directly for password-based authentication, just like with WinRM-based remoting.
@@ -12,17 +14,17 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 - **Persistent and Ephemeral Sessions**: Create and manage persistent `PSSession` objects or use one-liner commands for quick, ephemeral operations.
 - **Familiar Syntax**: Works like native PowerShell Remoting (`*-PSSession`, `Invoke-Command`, `Copy-Item`).
 - **File Transfer Support**: Easily send and receive files and directories to and from remote systems over SSH.
-- **Cross-Platform**: Works on any platform that supports PowerShell and SSH.
+- **Cross-Platform Key Authentication**: Key-based connections use PowerShell and OpenSSH facilities available across platforms. The bundled password-authentication helper is Windows-specific; see Requirements.
 
 ## Getting Started
 
 ### Installation
 
 1.  Clone or download this repository to a directory on your local machine.
-2.  Import the module directly from the `.psm1` file:
+2.  Import the module manifest:
 
     ```powershell
-    Import-Module .\SshSession.psm1
+    Import-Module .\SshSession.psd1
     ```
 
 3.  For persistent use, copy the `SshSession` directory to one of your PowerShell module paths (e.g., `$env:USERPROFILE\Documents\PowerShell\Modules`).
@@ -30,6 +32,13 @@ SshSession is a PowerShell module that simplifies using PowerShell Remoting over
 
     ```powershell
     Get-Command -Module SshSession
+    ```
+
+5.  Read the built-in help for any exported command:
+
+    ```powershell
+    Get-Help New-SshSession -Full
+    Get-Help Wait-SshComputer -Examples
     ```
 
 ## Usage
@@ -174,7 +183,7 @@ Receive-SshFile -Path '/var/log/app.log' -Destination '.\logs\' -Session $sessio
 
 ### `Wait-SshComputer`
 
-Waits for a remote computer to complete a potential restart and ensures the SSH session is working afterward. Acts as a checkpoint after running a command that might cause a reboot. If the server goes down during the grace period, waits for it to come back online (with optional stability checking) and repairs the session in-place. If the server never goes down, returns quietly.
+Waits for a remote computer to complete a potential restart and ensures the SSH session is working afterward. Acts as a checkpoint after running a command that might cause a reboot. If the server goes down during the grace period, waits for it to come back online (with optional stability checking) and repairs the session in-place. If the server never goes down, validates the supplied session directly and repairs it if its transport is stale.
 
 **Example 1: Wait after a command that might restart**
 
@@ -210,6 +219,7 @@ Wait-SshComputer -Session $session -ShutdownGracePeriodSeconds 30 -StableForSeco
 | `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
 | `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
 | `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
+| `-SshConnectionTimeoutSeconds` | Timeout for each SSH connectivity probe (default: 15). |
 | `-Port` | SSH port. Defaults to the port from the original session. |
 
 ### `Restart-SshComputer`
@@ -381,6 +391,7 @@ When credentials are provided, the module forces password-only authentication (`
 - **PowerShell 7.0 or later** on the local machine.
 - **PowerShell 7 (pwsh)** must be installed and available on the remote host. All session-based functions (`New-SshSession`, `Test-SshConnection`, etc.) rely on the PowerShell SSH subsystem, which requires `pwsh` on the remote end. `Test-SshConnection` validates this by running a `pwsh` command over SSH, so a successful test confirms that session creation will work.
 - **ssh.exe** must be available in the system PATH.
+- **Windows is required on the local machine for password authentication as currently packaged.** The included SSH askpass helper is `ssh-askpass.cmd`. Key-based authentication does not use that helper, but has not been tested by this repository on every platform.
 
 ## Known Limitations
 

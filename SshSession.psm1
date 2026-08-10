@@ -1017,8 +1017,9 @@ function Wait-SshComputer {
         server goes down, waits for it to come back online (with optional stability checking)
         and repairs the session in-place so the caller's variable remains usable.
         
-        If the server never goes down during the grace period, the function returns quietly
-        since the session is still healthy.
+        If the server never goes down during the grace period, the function validates the
+        supplied session directly before returning. If that validation reveals a stale
+        transport, the session is repaired in-place.
         
         The stability check is designed for scenarios like domain controller promotion where
         a server may restart multiple times. When -StableForSeconds is specified, the server
@@ -1056,6 +1057,9 @@ function Wait-SshComputer {
     
     .PARAMETER PollIntervalSeconds
         How often to test connectivity while waiting. Defaults to 5.
+
+    .PARAMETER SshConnectionTimeoutSeconds
+        Timeout, in seconds, for each SSH connectivity probe. Defaults to 15.
     
     .PARAMETER Port
         SSH port. Defaults to the port from the original session, or 22 if not available.
@@ -1123,7 +1127,7 @@ function Wait-SshComputer {
     $testParams = @{
         ComputerName   = $computerName
         Port           = $Port
-        TimeoutSeconds = [Math]::Min(10, $SshConnectionTimeoutSeconds)
+        TimeoutSeconds = $SshConnectionTimeoutSeconds
     }
 
     if ($Credential) {
@@ -1142,7 +1146,7 @@ function Wait-SshComputer {
             Write-Verbose "Server '$computerName' is no longer responding. Restart detected."
             break
         }
-        if ($Session.Status -ne 'Opened') {
+        if ($Session.State -ne 'Opened') {
             $serverWentDown = $true
             Write-Verbose "Session is broken. Restart detected."
             break
@@ -1152,55 +1156,70 @@ function Wait-SshComputer {
         Start-Sleep -Seconds $PollIntervalSeconds
     }
 
+    $hostReadyForRepair = $false
+
     if (-not $serverWentDown) {
-        Write-Verbose "Server '$computerName' remained online during grace period. No restart detected."
-        return
+        Write-Verbose "Server '$computerName' remained online during grace period. Validating the existing session."
+
+        try {
+            Invoke-Command -Session $Session -ScriptBlock { $null } -ErrorAction Stop
+            Write-Verbose "Existing session to '$computerName' is working. No restart detected."
+            return
+        }
+        catch [System.Management.Automation.Remoting.PSRemotingTransportException] {
+            # A fresh SSH connection works, but the supplied session has a stale transport.
+            # The host is already reachable, so skip the recovery wait and repair directly.
+            Write-Verbose "Existing session to '$computerName' has a stale transport. Repairing in-place."
+            $hostReadyForRepair = $true
+        }
     }
 
     # --- Phase 2: Wait for the server to come back ---
-    Write-Verbose "Waiting for '$computerName' to come back online (timeout: ${WaitTimeoutSeconds}s)."
+    if (-not $hostReadyForRepair) {
+        Write-Verbose "Waiting for '$computerName' to come back online (timeout: ${WaitTimeoutSeconds}s)."
 
-    $waitDeadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
-    $isOnline = $false
-    $stableStart = $null
+        $waitDeadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
+        $isOnline = $false
+        $stableStart = $null
 
-    while ((Get-Date) -lt $waitDeadline) {
-        $reachable = Test-SshConnection @testParams
+        while ((Get-Date) -lt $waitDeadline) {
+            $reachable = Test-SshConnection @testParams
 
-        if ($reachable) {
-            if ($StableForSeconds -le 0) {
-                $isOnline = $true
-                Write-Verbose "Server '$computerName' is back online."
-                break
+            if ($reachable) {
+                if ($StableForSeconds -le 0) {
+                    $isOnline = $true
+                    Write-Verbose "Server '$computerName' is back online."
+                    break
+                }
+
+                if (-not $stableStart) {
+                    $stableStart = Get-Date
+                    Write-Verbose "Server '$computerName' responded. Starting stability check (${StableForSeconds}s required)."
+                }
+
+                $stableElapsed = ((Get-Date) - $stableStart).TotalSeconds
+                if ($stableElapsed -ge $StableForSeconds) {
+                    $isOnline = $true
+                    Write-Verbose "Server '$computerName' has been stable for $([int]$stableElapsed) seconds. Stability check passed."
+                    break
+                }
+
+                $remaining = $StableForSeconds - [int]$stableElapsed
+                Write-Verbose "Server '$computerName' up for $([int]$stableElapsed)s, need ${remaining}s more for stability."
+            }
+            else {
+                if ($stableStart) {
+                    Write-Verbose "Server '$computerName' dropped during stability check. Resetting timer."
+                    $stableStart = $null
+                }
             }
 
-            if (-not $stableStart) {
-                $stableStart = Get-Date
-                Write-Verbose "Server '$computerName' responded. Starting stability check (${StableForSeconds}s required)."
-            }
-
-            $stableElapsed = ((Get-Date) - $stableStart).TotalSeconds
-            if ($stableElapsed -ge $StableForSeconds) {
-                $isOnline = $true
-                Write-Verbose "Server '$computerName' has been stable for $([int]$stableElapsed) seconds. Stability check passed."
-                break
-            }
-
-            $remaining = $StableForSeconds - [int]$stableElapsed
-            Write-Verbose "Server '$computerName' up for $([int]$stableElapsed)s, need ${remaining}s more for stability."
+            Start-Sleep -Seconds $PollIntervalSeconds
         }
-        else {
-            if ($stableStart) {
-                Write-Verbose "Server '$computerName' dropped during stability check. Resetting timer."
-                $stableStart = $null
-            }
+
+        if (-not $isOnline) {
+            throw "Server '$computerName' did not come back online within $WaitTimeoutSeconds seconds."
         }
-
-        Start-Sleep -Seconds $PollIntervalSeconds
-    }
-
-    if (-not $isOnline) {
-        throw "Server '$computerName' did not come back online within $WaitTimeoutSeconds seconds."
     }
 
     # --- Phase 3: Repair the session in-place ---
