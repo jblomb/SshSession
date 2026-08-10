@@ -1,6 +1,6 @@
 @{
     RootModule        = 'SshSession.psm1'
-    ModuleVersion     = '1.9.3'
+    ModuleVersion     = '2.0.0'
     GUID              = 'a3f7e8d2-5b4c-4a1f-9e6d-8c2b3a4f5e6d'
     Author            = 'Jan Blomberg'
     CompanyName       = ''
@@ -29,6 +29,13 @@
             LicenseUri   = ''
             ProjectUri   = ''
             ReleaseNotes = @'
+2.0.0
+- Breaking: StableForSeconds now requires the current OS boot to be at least the requested age instead of requiring uninterrupted successful SSH probes
+- Temporary SSH and network failures no longer reset stability; an actual OS restart naturally resets the remote uptime
+- Added a shared native SSH probe and remote uptime detection using Environment.TickCount64
+- SSH commands now use structured argument arrays, and omitted ports honor SSH configuration before falling back to OpenSSH's default
+- Fixed Wait-SshComputer session recovery by validating apparently healthy sessions, using the PSSession State property, and honoring the configured probe timeout
+
 1.9.3
 - Improved: Test-SshConnection now uses Write-Warning instead of Write-Verbose for failure messages, making connection problems visible without -Verbose
 - Added Format-SshError helper inside Test-SshConnection for indented, readable error output
