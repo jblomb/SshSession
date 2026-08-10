@@ -45,7 +45,9 @@ For implementation details and maintenance guidance, see [Architecture](docs/ARC
 
 ### `Test-SshConnection`
 
-Tests SSH connectivity to a remote host with timeout protection. Returns `$true` if the connection succeeds, `$false` otherwise. Failure reasons (timeouts, authentication errors, SSH errors) are shown as warnings automatically. Use `-Verbose` for additional diagnostic details like the SSH command being executed.
+Tests native SSH command execution and confirms that `pwsh` is available on the remote host. Returns `$true` if the connection succeeds, `$false` otherwise. Failure reasons (timeouts, authentication errors, SSH errors) are shown as warnings automatically. Use `-Verbose` for additional diagnostic details like the SSH command being executed.
+
+When `-Port` is omitted, OpenSSH uses the port from the matching SSH config entry or defaults to 22. This test does not validate the PowerShell SSH subsystem used by `New-PSSession`; session creation can still fail if that subsystem is missing or misconfigured.
 
 **Example 1: Test connectivity before running commands**
 
@@ -59,6 +61,13 @@ if (Test-SshConnection -ComputerName 'server.example.com' -Credential $cred) {
 
 ```powershell
 Test-SshConnection -ComputerName 'server.example.com' -TimeoutSeconds 10 -Verbose
+```
+
+**Example 3: Use the port from SSH config**
+
+```powershell
+# The Host entry can define HostName, Port, ProxyJump, and other SSH settings.
+Test-SshConnection -ComputerName 'customer-server'
 ```
 
 ### `New-SshSession`
@@ -197,7 +206,7 @@ Invoke-SshCommand -Session $session -ScriptBlock { Get-WindowsFeature AD-Domain-
 
 **Example 2: Domain controller promotion (multiple reboots)**
 
-Give 2 minutes for shutdown to begin, wait up to 15 minutes, and require 2 minutes of continuous uptime before considering the server stable.
+Give 2 minutes for shutdown to begin, wait up to 15 minutes, and require the current OS boot to be at least 2 minutes old before considering the server stable. Temporary SSH failures do not reset this uptime requirement.
 
 ```powershell
 Invoke-SshCommand -Session $session -ScriptBlock { Install-ADDSForest -DomainName 'corp.local' -Force }
@@ -217,10 +226,10 @@ Wait-SshComputer -Session $session -ShutdownGracePeriodSeconds 30 -StableForSeco
 | `-Credential` | Optional credential override. If omitted, uses the credential stored on the session. |
 | `-ShutdownGracePeriodSeconds` | How long to monitor for a shutdown before assuming no restart occurred (default: 60). |
 | `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
-| `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
+| `-StableForSeconds` | Minimum age of the current OS boot before the server is considered online. Temporary SSH failures do not reset uptime (default: 0). |
 | `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
 | `-SshConnectionTimeoutSeconds` | Timeout for each SSH connectivity probe (default: 15). |
-| `-Port` | SSH port. Defaults to the port from the original session. |
+| `-Port` | SSH port override. If omitted, uses the original session's explicit port, SSH config, or OpenSSH's default port 22. |
 
 ### `Restart-SshComputer`
 
@@ -242,7 +251,7 @@ Restart-SshComputer -Session $session -Credential $newCred
 
 **Example 3: Domain controller promotion (multiple reboots)**
 
-Wait up to 15 minutes for the server to come back, and require it to stay up for 2 minutes continuously before considering it stable.
+Wait up to 15 minutes for the server to come back, and require the current OS boot to be at least 2 minutes old before considering it stable.
 
 ```powershell
 Restart-SshComputer -Session $session -Credential $domainCred -StableForSeconds 120 -WaitTimeoutSeconds 900
@@ -260,9 +269,9 @@ Restart-SshComputer -Session $session -PollIntervalSeconds 10 -Verbose
 | `-Credential` | Optional credential override. If omitted, uses the credential stored on the session. |
 | `-ShutdownGracePeriodSeconds` | How long to monitor for a shutdown after sending the restart command (default: 120). |
 | `-WaitTimeoutSeconds` | Max total seconds to wait for the server to come back (default: 600). |
-| `-StableForSeconds` | How long the server must stay up continuously before it's considered online (default: 0). |
+| `-StableForSeconds` | Minimum age of the current OS boot before the server is considered online. Temporary SSH failures do not reset uptime (default: 0). |
 | `-PollIntervalSeconds` | How often to check connectivity (default: 5). |
-| `-Port` | SSH port. Defaults to the port from the original session. |
+| `-Port` | SSH port override. If omitted, uses the original session's explicit port, SSH config, or OpenSSH's default port 22. |
 
 ### `Enter-SshConsole`
 
@@ -316,7 +325,7 @@ Enter-SshConsole -ComputerName 'server.example.com' -Credential $cred -Options @
 | `-Session` | An existing `PSSession` to extract connection details from. The session itself is not used. |
 | `-Credential` | Optional credential for password-based authentication. |
 | `-UserName` | Optional username for key-based authentication. |
-| `-Port` | SSH port. Defaults to 22, or the port from the session. |
+| `-Port` | SSH port override. If omitted, uses the supplied session's explicit port, SSH config, or OpenSSH's default port 22. |
 | `-Shell` | Remote shell to launch: `pwsh` (default), `powershell`, `cmd`, `bash`, or `Default` (server's login shell). |
 | `-Options` | Additional SSH options as a hashtable, passed as `-o Key=Value` arguments. |
 
@@ -389,7 +398,7 @@ When credentials are provided, the module forces password-only authentication (`
 ## Requirements
 
 - **PowerShell 7.0 or later** on the local machine.
-- **PowerShell 7 (pwsh)** must be installed and available on the remote host. All session-based functions (`New-SshSession`, `Test-SshConnection`, etc.) rely on the PowerShell SSH subsystem, which requires `pwsh` on the remote end. `Test-SshConnection` validates this by running a `pwsh` command over SSH, so a successful test confirms that session creation will work.
+- **PowerShell 7 (pwsh)** must be installed and available on the remote host. Session-based functions also require a correctly configured PowerShell SSH subsystem. `Test-SshConnection` confirms native SSH command execution and remote `pwsh` availability, but does not validate the subsystem itself.
 - **ssh.exe** must be available in the system PATH.
 - **Windows is required on the local machine for password authentication as currently packaged.** The included SSH askpass helper is `ssh-askpass.cmd`. Key-based authentication does not use that helper, but has not been tested by this repository on every platform.
 

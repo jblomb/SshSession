@@ -47,7 +47,7 @@ function Remove-SshAskpassEnvironment {
 }
 
 function Get-SshSessionInfo {
-    <# Extracts ComputerName, UserName, and Port from an existing PSSession. #>
+    <# Extracts ComputerName, UserName, Port, and stored Credential from an existing PSSession. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -59,10 +59,12 @@ function Get-SshSessionInfo {
 
     try {
         $sessionPort = $Session.Runspace.ConnectionInfo.Port
-        $port = if ($sessionPort -and $sessionPort -gt 0) { $sessionPort } else { 22 }
+        # SSHConnectionInfo uses 0 when no port was explicitly supplied. Preserve that
+        # sentinel so OpenSSH can resolve Port from its config (or default to 22).
+        $port = if ($sessionPort -gt 0) { $sessionPort } else { 0 }
     }
     catch {
-        $port = 22
+        $port = 0
     }
 
     # Extract stored credential if present (attached by New-SshSession)
@@ -193,6 +195,171 @@ function Repair-SshSession {
     }
 }
 
+function Invoke-SshProbe {
+    <#
+        Runs an encoded PowerShell command through native SSH with timeout and
+        askpass handling. Returns probe metadata instead of writing success or
+        failure output, allowing callers to interpret their own response marker.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory)]
+        [string]$Script,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter()]
+        [string]$UserName,
+
+        [Parameter(Mandatory)]
+        [int]$TimeoutSeconds,
+
+        [Parameter()]
+        [ValidateRange(1, 65535)]
+        [int]$Port
+    )
+
+    $effectiveUserName = if ($Credential) { $Credential.UserName } elseif ($UserName) { $UserName } else { $null }
+    $sshTarget = if ($effectiveUserName) { "$effectiveUserName@$ComputerName" } else { $ComputerName }
+
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($Script)
+    $encodedCommand = [Convert]::ToBase64String($bytes)
+
+    $sshArguments = @(
+        '-o', 'StrictHostKeyChecking=no'
+        '-o', "ConnectTimeout=$TimeoutSeconds"
+    )
+
+    if ($Credential) {
+        $sshArguments += @(
+            '-o', 'PreferredAuthentications=password'
+            '-o', 'PubkeyAuthentication=no'
+        )
+    }
+
+    if ($PSBoundParameters.ContainsKey('Port')) {
+        $sshArguments += @('-p', $Port)
+    }
+
+    $sshArguments += @('--', $sshTarget, "pwsh -e $encodedCommand")
+    $jobScript = {
+        param([string[]]$SshArguments)
+        & ssh @SshArguments 2>&1
+    }
+
+    $job = $null
+    try {
+        if ($Credential) {
+            Set-SshAskpassEnvironment -Credential $Credential
+        }
+
+        $job = Start-Job -ScriptBlock $jobScript -ArgumentList (,$sshArguments)
+        $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+
+        if (-not $completed) {
+            return [PSCustomObject]@{
+                TimedOut    = $true
+                Output      = @()
+                Exception   = $null
+                SshArguments = $sshArguments
+            }
+        }
+
+        return [PSCustomObject]@{
+            TimedOut    = $false
+            Output      = @(Receive-Job -Job $job 2>&1)
+            Exception   = $null
+            SshArguments = $sshArguments
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            TimedOut    = $false
+            Output      = @()
+            Exception   = $_.Exception
+            SshArguments = $sshArguments
+        }
+    }
+    finally {
+        if ($Credential) {
+            Remove-SshAskpassEnvironment
+        }
+        if ($job) {
+            Stop-Job -Job $job -ErrorAction SilentlyContinue
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-SshComputerUptime {
+    <# Returns whole seconds since the remote OS booted, or $null when the probe fails. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$ComputerName,
+
+        [Parameter()]
+        [PSCredential]$Credential,
+
+        [Parameter()]
+        [string]$UserName,
+
+        [Parameter(Mandatory)]
+        [int]$TimeoutSeconds,
+
+        [Parameter()]
+        [ValidateRange(1, 65535)]
+        [int]$Port
+    )
+
+    $uptimeMarker = 'SSHSESSION_UPTIME_MS:'
+    $probeParams = @{
+        ComputerName   = $ComputerName
+        Script         = "Write-Output ('$uptimeMarker' + [Environment]::TickCount64)"
+        TimeoutSeconds = $TimeoutSeconds
+    }
+
+    if ($Credential) {
+        $probeParams['Credential'] = $Credential
+    }
+    elseif ($UserName) {
+        $probeParams['UserName'] = $UserName
+    }
+
+    if ($PSBoundParameters.ContainsKey('Port')) {
+        $probeParams['Port'] = $Port
+    }
+
+    $probe = Invoke-SshProbe @probeParams
+    Write-Verbose "Testing SSH connection and OS uptime: ssh $($probe.SshArguments -join ' ')"
+
+    if ($probe.TimedOut) {
+        Write-Warning "SSH uptime probe to '$ComputerName' timed out after $TimeoutSeconds seconds."
+        return $null
+    }
+
+    if ($probe.Exception) {
+        Write-Warning "SSH uptime probe to '$ComputerName' failed: $($probe.Exception.Message)"
+        return $null
+    }
+
+    foreach ($line in $probe.Output) {
+        $text = $line.ToString().Trim()
+        if ($text -match "^$([regex]::Escape($uptimeMarker))(\d+)$") {
+            Write-Verbose "SSH uptime probe to '$ComputerName' succeeded."
+            return [long]([math]::Floor(([long]$Matches[1]) / 1000))
+        }
+    }
+
+    $resultText = ($probe.Output | Out-String).Trim()
+    Write-Warning "SSH uptime probe to '$ComputerName' returned no valid uptime value.`n    $resultText"
+    return $null
+}
+
 #endregion Private Functions
 
 #region Public Functions
@@ -205,8 +372,12 @@ function Test-SshConnection {
     .DESCRIPTION
         Performs a quick SSH connection test by executing a simple PowerShell command
         on the remote host. Uses a background job with timeout to prevent hanging
-        on unreachable hosts. Tests the full connection path including any ProxyJump
-        configurations in your SSH config.
+        on unreachable hosts. Honors host settings such as Port and ProxyJump from
+        your SSH config unless the corresponding command-line setting is supplied.
+
+        This validates native SSH command execution and the availability of pwsh on
+        the remote host. It does not validate the PowerShell SSH subsystem used by
+        New-PSSession.
     
     .PARAMETER ComputerName
         The hostname or IP address to test. This should match a host entry in your
@@ -222,7 +393,8 @@ function Test-SshConnection {
         Maximum seconds to wait for connection. Defaults to 30.
     
     .PARAMETER Port
-        SSH port. Defaults to 22.
+        SSH port. When omitted, OpenSSH uses the matching SSH config value or its
+        default port of 22.
     
     .EXAMPLE
         Test-SshConnection -ComputerName server01
@@ -250,10 +422,12 @@ function Test-SshConnection {
         [string]$UserName,
 
         [Parameter()]
+        [ValidateRange(1, 2147483647)]
         [int]$TimeoutSeconds = 30,
 
         [Parameter()]
-        [int]$Port = 22
+        [ValidateRange(1, 65535)]
+        [int]$Port
     )
 
     function Format-SshError {
@@ -262,66 +436,44 @@ function Test-SshConnection {
         return "$Message`n$indented"
     }
 
-    # Determine username for SSH target
-    $effectiveUserName = if ($Credential) { $Credential.UserName } elseif ($UserName) { $UserName } else { $null }
-    $sshTarget = if ($effectiveUserName) { "$effectiveUserName@$ComputerName" } else { $ComputerName }
+    $probeParams = @{
+        ComputerName   = $ComputerName
+        Script         = "Return 'OK!'"
+        TimeoutSeconds = $TimeoutSeconds
+    }
 
-    # Simple test command - returns 'OK!' if PowerShell runs successfully
-    $testScript = "Return 'OK!'"
-    $bytes = [System.Text.Encoding]::Unicode.GetBytes($testScript)
-    $encodedCommand = [Convert]::ToBase64String($bytes)
-
-    # Build SSH command with strict host key checking disabled for automation
-    # When using credentials, force password auth only to prevent key fallback
-    $sshOptions = "-o StrictHostKeyChecking=no -o ConnectTimeout=$TimeoutSeconds"
     if ($Credential) {
-        $sshOptions += " -o PreferredAuthentications=password -o PubkeyAuthentication=no"
+        $probeParams['Credential'] = $Credential
     }
-    
-    $sshCommand = "ssh $sshOptions -p $Port $sshTarget 'pwsh -e $encodedCommand'"
-    $scriptBlock = [scriptblock]::Create($sshCommand)
-
-    Write-Verbose "Testing SSH connection: $sshCommand"
-
-    $job = $null
-    try {
-        if ($Credential) {
-            Set-SshAskpassEnvironment -Credential $Credential
-        }
-
-        $job = Start-Job -ScriptBlock $scriptBlock
-        $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
-
-        if (-not $completed) {
-            Write-Warning "SSH connection to '$ComputerName' timed out after $TimeoutSeconds seconds."
-            return $false
-        }
-
-        $result = Receive-Job -Job $job 2>&1
-        $resultText = ($result | Out-String).Trim()
-
-        if ($result -contains 'OK!') {
-            Write-Verbose "SSH connection to '$ComputerName' succeeded."
-            return $true
-        }
-        else {
-            Write-Warning (Format-SshError "SSH connection to '$ComputerName' failed:" $resultText)
-            return $false
-        }
+    elseif ($UserName) {
+        $probeParams['UserName'] = $UserName
     }
-    catch {
-        Write-Warning (Format-SshError "SSH connection to '$ComputerName' failed:" $_.Exception.Message)
+
+    if ($PSBoundParameters.ContainsKey('Port')) {
+        $probeParams['Port'] = $Port
+    }
+
+    $probe = Invoke-SshProbe @probeParams
+    Write-Verbose "Testing SSH connection: ssh $($probe.SshArguments -join ' ')"
+
+    if ($probe.TimedOut) {
+        Write-Warning "SSH connection to '$ComputerName' timed out after $TimeoutSeconds seconds."
         return $false
     }
-    finally {
-        if ($Credential) {
-            Remove-SshAskpassEnvironment
-        }
-        if ($job) {
-            Stop-Job -Job $job -ErrorAction SilentlyContinue
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        }
+
+    if ($probe.Exception) {
+        Write-Warning (Format-SshError "SSH connection to '$ComputerName' failed:" $probe.Exception.Message)
+        return $false
     }
+
+    $resultText = ($probe.Output | Out-String).Trim()
+    if ($probe.Output -contains 'OK!') {
+        Write-Verbose "SSH connection to '$ComputerName' succeeded."
+        return $true
+    }
+
+    Write-Warning (Format-SshError "SSH connection to '$ComputerName' failed:" $resultText)
+    return $false
 }
 
 function New-SshSession {
@@ -361,7 +513,8 @@ function New-SshSession {
         Optional username. If Credential is provided, the username from the credential is used instead.
     
     .PARAMETER Port
-        SSH port. Defaults to 22, or the port from the original session when using -Session.
+        SSH port. When omitted, uses the port explicitly stored on the original session,
+        an SSH config value, or OpenSSH's default port of 22.
     
     .PARAMETER Options
         Additional SSH options as a hashtable, passed to New-PSSession -Options.
@@ -405,6 +558,7 @@ function New-SshSession {
         [string]$UserName,
 
         [Parameter()]
+        [ValidateRange(1, 65535)]
         [int]$Port,
 
         [Parameter()]
@@ -414,16 +568,20 @@ function New-SshSession {
         [switch]$SkipTest,
 
         [Parameter()]
+        [ValidateRange(1, 2147483647)]
         [int]$TestTimeoutSeconds = 30
     )
+
+    $hasPort = $PSBoundParameters.ContainsKey('Port')
 
     # If Session is provided, extract connection info and remove the old session
     if ($PSCmdlet.ParameterSetName -eq 'Session') {
         $info = Get-SshSessionInfo -Session $Session
         $ComputerName = $info.ComputerName
 
-        if (-not $PSBoundParameters.ContainsKey('Port')) {
+        if (-not $hasPort -and $info.Port -gt 0) {
             $Port = $info.Port
+            $hasPort = $true
         }
 
         # Fall back to stored credential if no explicit credential provided
@@ -440,17 +598,15 @@ function New-SshSession {
         Remove-PSSession -Session $Session -ErrorAction SilentlyContinue
     }
 
-    # Default port if not explicitly set
-    if (-not $PSBoundParameters.ContainsKey('Port') -and $PSCmdlet.ParameterSetName -ne 'Session') {
-        $Port = 22
-    }
-
     # Test connectivity first unless skipped
     if (-not $SkipTest) {
         $testParams = @{
             ComputerName   = $ComputerName
-            Port           = $Port
             TimeoutSeconds = $TestTimeoutSeconds
+        }
+
+        if ($hasPort) {
+            $testParams['Port'] = $Port
         }
 
         if ($Credential) {
@@ -465,11 +621,15 @@ function New-SshSession {
         }
     }
 
-    Write-Verbose "Creating SSH session to '$ComputerName' on port $Port."
+    $portDescription = if ($hasPort) { "port $Port" } else { 'the SSH-configured/default port' }
+    Write-Verbose "Creating SSH session to '$ComputerName' on $portDescription."
 
     $sessionParams = @{
         HostName = $ComputerName
-        Port     = $Port
+    }
+
+    if ($hasPort) {
+        $sessionParams['Port'] = $Port
     }
 
     if ($Options) {
@@ -558,7 +718,8 @@ function Invoke-SshCommand {
         Optional username for key-based authentication when Credential is not provided.
     
     .PARAMETER Port
-        SSH port. Defaults to 22.
+        SSH port. When omitted, OpenSSH uses the matching SSH config value or its
+        default port of 22.
     
     .PARAMETER SkipTest
         Skip the connectivity test before creating the session.
@@ -596,12 +757,14 @@ function Invoke-SshCommand {
         [string]$UserName,
 
         [Parameter(ParameterSetName = 'ComputerName')]
-        [int]$Port = 22,
+        [ValidateRange(1, 65535)]
+        [int]$Port,
 
         [Parameter()]
         [switch]$SkipTest,
 
         [Parameter()]
+        [ValidateRange(1, 2147483647)]
         [int]$TestTimeoutSeconds = 30
     )
 
@@ -652,9 +815,12 @@ function Invoke-SshCommand {
             
             $sessionParams = @{
                 ComputerName       = $ComputerName
-                Port               = $Port
                 SkipTest           = $SkipTest
                 TestTimeoutSeconds = $TestTimeoutSeconds
+            }
+
+            if ($PSBoundParameters.ContainsKey('Port')) {
+                $sessionParams['Port'] = $Port
             }
 
             if ($Credential) {
@@ -711,7 +877,8 @@ function Send-SshFile {
         Optional username for key-based authentication.
     
     .PARAMETER Port
-        SSH port. Defaults to 22.
+        SSH port. When omitted, OpenSSH uses the matching SSH config value or its
+        default port of 22.
     
     .PARAMETER Recurse
         Copy directories recursively.
@@ -758,7 +925,8 @@ function Send-SshFile {
         [string]$UserName,
 
         [Parameter(ParameterSetName = 'ComputerName')]
-        [int]$Port = 22,
+        [ValidateRange(1, 65535)]
+        [int]$Port,
 
         [Parameter()]
         [switch]$Recurse,
@@ -770,6 +938,7 @@ function Send-SshFile {
         [switch]$SkipTest,
 
         [Parameter()]
+        [ValidateRange(1, 2147483647)]
         [int]$TestTimeoutSeconds = 30
     )
 
@@ -817,9 +986,12 @@ function Send-SshFile {
             
             $sessionParams = @{
                 ComputerName       = $ComputerName
-                Port               = $Port
                 SkipTest           = $SkipTest
                 TestTimeoutSeconds = $TestTimeoutSeconds
+            }
+
+            if ($PSBoundParameters.ContainsKey('Port')) {
+                $sessionParams['Port'] = $Port
             }
 
             if ($Credential) {
@@ -876,7 +1048,8 @@ function Receive-SshFile {
         Optional username for key-based authentication.
     
     .PARAMETER Port
-        SSH port. Defaults to 22.
+        SSH port. When omitted, OpenSSH uses the matching SSH config value or its
+        default port of 22.
     
     .PARAMETER Recurse
         Copy directories recursively.
@@ -923,7 +1096,8 @@ function Receive-SshFile {
         [string]$UserName,
 
         [Parameter(ParameterSetName = 'ComputerName')]
-        [int]$Port = 22,
+        [ValidateRange(1, 65535)]
+        [int]$Port,
 
         [Parameter()]
         [switch]$Recurse,
@@ -935,6 +1109,7 @@ function Receive-SshFile {
         [switch]$SkipTest,
 
         [Parameter()]
+        [ValidateRange(1, 2147483647)]
         [int]$TestTimeoutSeconds = 30
     )
 
@@ -982,9 +1157,12 @@ function Receive-SshFile {
             
             $sessionParams = @{
                 ComputerName       = $ComputerName
-                Port               = $Port
                 SkipTest           = $SkipTest
                 TestTimeoutSeconds = $TestTimeoutSeconds
+            }
+
+            if ($PSBoundParameters.ContainsKey('Port')) {
+                $sessionParams['Port'] = $Port
             }
 
             if ($Credential) {
@@ -1022,9 +1200,9 @@ function Wait-SshComputer {
         transport, the session is repaired in-place.
         
         The stability check is designed for scenarios like domain controller promotion where
-        a server may restart multiple times. When -StableForSeconds is specified, the server
-        must respond to connectivity tests continuously for that duration. If the server drops
-        during the stability window, the timer resets and waiting continues.
+        a server may restart multiple times. When -StableForSeconds is specified, the current
+        operating-system boot must be at least that old. Temporary SSH or network failures do
+        not reset the requirement; another OS restart naturally resets the reported uptime.
         
         The session is repaired in-place using reflection, so no reassignment is needed. After
         this function returns, the caller's session variable is guaranteed to be working.
@@ -1050,8 +1228,8 @@ function Wait-SshComputer {
         This includes time spent in stability checks. Defaults to 600.
     
     .PARAMETER StableForSeconds
-        How long the server must respond to connectivity tests continuously before it is
-        considered truly online. If the server drops during this window, the timer resets.
+        Minimum age, in seconds, of the current operating-system boot before the server is
+        considered truly online. Temporary SSH or network failures do not reset uptime.
         Use higher values (e.g. 120-300) for scenarios with multiple reboots like DC promotion.
         Defaults to 0 (first successful connection is sufficient).
     
@@ -1062,7 +1240,8 @@ function Wait-SshComputer {
         Timeout, in seconds, for each SSH connectivity probe. Defaults to 15.
     
     .PARAMETER Port
-        SSH port. Defaults to the port from the original session, or 22 if not available.
+        SSH port. When omitted, uses the port explicitly stored on the original session,
+        an SSH config value, or OpenSSH's default port of 22.
     
     .EXAMPLE
         Invoke-Command -Session $session -ScriptBlock { Install-WindowsFeature AD-Domain-Services -Restart }
@@ -1100,9 +1279,11 @@ function Wait-SshComputer {
         [int]$PollIntervalSeconds = 5,
 
         [Parameter()]
+        [ValidateRange(1, 2147483647)]
         [int]$SshConnectionTimeoutSeconds = 15,
 
         [Parameter()]
+        [ValidateRange(1, 65535)]
         [int]$Port
     )
 
@@ -1117,8 +1298,10 @@ function Wait-SshComputer {
         Write-Verbose "Using stored credential from session for '$computerName'."
     }
 
-    if (-not $PSBoundParameters.ContainsKey('Port')) {
+    $hasPort = $PSBoundParameters.ContainsKey('Port')
+    if (-not $hasPort -and $info.Port -gt 0) {
         $Port = $info.Port
+        $hasPort = $true
     }
 
     Write-Verbose "Monitoring '$computerName' for potential restart (grace period: ${ShutdownGracePeriodSeconds}s)."
@@ -1126,8 +1309,11 @@ function Wait-SshComputer {
     # --- Phase 1: Watch for shutdown during grace period ---
     $testParams = @{
         ComputerName   = $computerName
-        Port           = $Port
         TimeoutSeconds = $SshConnectionTimeoutSeconds
+    }
+
+    if ($hasPort) {
+        $testParams['Port'] = $Port
     }
 
     if ($Credential) {
@@ -1180,37 +1366,26 @@ function Wait-SshComputer {
 
         $waitDeadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
         $isOnline = $false
-        $stableStart = $null
-
         while ((Get-Date) -lt $waitDeadline) {
-            $reachable = Test-SshConnection @testParams
-
-            if ($reachable) {
-                if ($StableForSeconds -le 0) {
+            if ($StableForSeconds -le 0) {
+                if (Test-SshConnection @testParams) {
                     $isOnline = $true
                     Write-Verbose "Server '$computerName' is back online."
                     break
                 }
+            }
+            else {
+                $uptimeSeconds = Get-SshComputerUptime @testParams
 
-                if (-not $stableStart) {
-                    $stableStart = Get-Date
-                    Write-Verbose "Server '$computerName' responded. Starting stability check (${StableForSeconds}s required)."
-                }
-
-                $stableElapsed = ((Get-Date) - $stableStart).TotalSeconds
-                if ($stableElapsed -ge $StableForSeconds) {
+                if ($null -ne $uptimeSeconds -and $uptimeSeconds -ge $StableForSeconds) {
                     $isOnline = $true
-                    Write-Verbose "Server '$computerName' has been stable for $([int]$stableElapsed) seconds. Stability check passed."
+                    Write-Verbose "Server '$computerName' has been running for $uptimeSeconds seconds since its last OS restart. Stability check passed."
                     break
                 }
 
-                $remaining = $StableForSeconds - [int]$stableElapsed
-                Write-Verbose "Server '$computerName' up for $([int]$stableElapsed)s, need ${remaining}s more for stability."
-            }
-            else {
-                if ($stableStart) {
-                    Write-Verbose "Server '$computerName' dropped during stability check. Resetting timer."
-                    $stableStart = $null
+                if ($null -ne $uptimeSeconds) {
+                    $remaining = $StableForSeconds - $uptimeSeconds
+                    Write-Verbose "Server '$computerName' has been running for ${uptimeSeconds}s since its last OS restart; need ${remaining}s more."
                 }
             }
 
@@ -1227,8 +1402,11 @@ function Wait-SshComputer {
 
     $newSessionParams = @{
         ComputerName = $computerName
-        Port         = $Port
         SkipTest     = $true  # We already confirmed connectivity
+    }
+
+    if ($hasPort) {
+        $newSessionParams['Port'] = $Port
     }
 
     if ($Credential) {
@@ -1260,9 +1438,9 @@ function Restart-SshComputer {
         verify stability. The session is repaired in-place, so no reassignment is needed.
         
         The stability check is designed for scenarios like domain controller promotion where
-        a server may restart multiple times. When -StableForSeconds is specified, the server
-        must respond to connectivity tests continuously for that duration. If the server drops
-        during the stability window, the timer resets and waiting continues.
+        a server may restart multiple times. When -StableForSeconds is specified, the current
+        operating-system boot must be at least that old. Temporary SSH or network failures do
+        not reset the requirement; another OS restart naturally resets the reported uptime.
     
     .PARAMETER Session
         The existing PSSession to the remote computer. This session will be used to send the
@@ -1285,8 +1463,8 @@ function Restart-SshComputer {
         This includes time spent in stability checks. Defaults to 600.
     
     .PARAMETER StableForSeconds
-        How long the server must respond to connectivity tests continuously before it is
-        considered truly online. If the server drops during this window, the timer resets.
+        Minimum age, in seconds, of the current operating-system boot before the server is
+        considered truly online. Temporary SSH or network failures do not reset uptime.
         Use higher values (e.g. 120-300) for scenarios with multiple reboots like DC promotion.
         Defaults to 0 (first successful connection is sufficient).
     
@@ -1294,7 +1472,8 @@ function Restart-SshComputer {
         How often to test connectivity while waiting. Defaults to 5.
     
     .PARAMETER Port
-        SSH port. Defaults to the port from the original session, or 22 if not available.
+        SSH port. When omitted, uses the port explicitly stored on the original session,
+        an SSH config value, or OpenSSH's default port of 22.
     
     .EXAMPLE
         Restart-SshComputer -Session $session
@@ -1333,6 +1512,7 @@ function Restart-SshComputer {
         [int]$PollIntervalSeconds = 5,
 
         [Parameter()]
+        [ValidateRange(1, 65535)]
         [int]$Port
     )
 
@@ -1411,7 +1591,8 @@ function Enter-SshConsole {
         Optional username for key-based authentication. Ignored if Credential is provided.
     
     .PARAMETER Port
-        SSH port. Defaults to 22, or the port from the session when using -Session.
+        SSH port. When omitted, uses the port explicitly stored on the supplied session,
+        an SSH config value, or OpenSSH's default port of 22.
     
     .PARAMETER Shell
         The remote shell to launch. Defaults to 'pwsh' to match PSSession behavior.
@@ -1460,6 +1641,7 @@ function Enter-SshConsole {
         [string]$UserName,
 
         [Parameter()]
+        [ValidateRange(1, 65535)]
         [int]$Port,
 
         [Parameter()]
@@ -1470,13 +1652,16 @@ function Enter-SshConsole {
         [hashtable]$Options
     )
 
+    $hasPort = $PSBoundParameters.ContainsKey('Port')
+
     # If Session is provided, extract connection info
     if ($PSCmdlet.ParameterSetName -eq 'Session') {
         $info = Get-SshSessionInfo -Session $Session
         $ComputerName = $info.ComputerName
 
-        if (-not $PSBoundParameters.ContainsKey('Port')) {
+        if (-not $hasPort -and $info.Port -gt 0) {
             $Port = $info.Port
+            $hasPort = $true
         }
 
         if (-not $Credential -and $info.Credential) {
@@ -1489,13 +1674,12 @@ function Enter-SshConsole {
         }
     }
 
-    # Default port
-    if (-not $PSBoundParameters.ContainsKey('Port') -and $PSCmdlet.ParameterSetName -ne 'Session') {
-        $Port = 22
-    }
-
     # Build SSH arguments
-    $sshArgs = @('-o', 'StrictHostKeyChecking=no', '-p', $Port)
+    $sshArgs = @('-o', 'StrictHostKeyChecking=no')
+
+    if ($hasPort) {
+        $sshArgs += @('-p', $Port)
+    }
 
     if ($Credential) {
         $sshArgs += '-o', 'PreferredAuthentications=password'
@@ -1512,7 +1696,7 @@ function Enter-SshConsole {
     # Build target
     $effectiveUserName = if ($Credential) { $Credential.UserName } elseif ($UserName) { $UserName } else { $null }
     $sshTarget = if ($effectiveUserName) { "$effectiveUserName@$ComputerName" } else { $ComputerName }
-    $sshArgs += $sshTarget
+    $sshArgs += @('--', $sshTarget)
 
     # When a specific shell is requested, force TTY allocation and append the shell command
     if ($Shell -ne 'Default') {

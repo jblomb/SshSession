@@ -56,14 +56,18 @@ Because the askpass state is process-wide, overlapping password operations with 
 
 ## Connectivity testing
 
-`Test-SshConnection` builds an encoded PowerShell command whose success marker is `OK!`, then runs native SSH inside a background job. The outer timeout prevents the caller from waiting indefinitely. The function:
+The private `Invoke-SshProbe` helper runs encoded PowerShell commands through native SSH with a structured argument array inside a background job. The argument array prevents hostnames and usernames from being interpreted as executable PowerShell text. The outer timeout prevents the caller from waiting indefinitely. `Test-SshConnection` uses this helper with the success marker `OK!` and:
 
 - returns `$true` only when the output contains the marker;
 - returns `$false` for timeouts, SSH failures, authentication failures, and caught exceptions;
 - writes failure details as warnings; and
 - always removes its background job and restores askpass state.
 
-`New-SshSession` calls this probe unless `-SkipTest` is present. The restart functions reuse it for state detection, so a successful probe means both SSH and remote `pwsh` are usable, not merely that TCP port 22 is open.
+When no port is explicitly supplied, the function omits `-p` so OpenSSH can resolve `Port` from its configuration or use its default of 22. Callers preserve this unspecified state rather than binding a default port before invoking the test.
+
+`New-SshSession` calls this probe unless `-SkipTest` is present. The restart functions reuse it for state detection, so a successful probe means both native SSH command execution and remote `pwsh` are usable, not merely that an SSH TCP port is open. It does not validate the PowerShell SSH subsystem used by `New-PSSession`.
+
+`Get-SshComputerUptime` uses the same helper to retrieve `[Environment]::TickCount64`. Keeping connectivity and uptime probes on the same native SSH path ensures they share credential, port, SSH-config, timeout, and cleanup behavior.
 
 ## Session repair and retry
 
@@ -91,7 +95,7 @@ Reflection also means repaired sessions have special registry and lifecycle beha
 `Wait-SshComputer` has three phases:
 
 1. **Shutdown detection:** probe until `ShutdownGracePeriodSeconds` expires. If the host stays reachable and the session remains open, validate the supplied session with a harmless remote command. Return when it succeeds; if it exposes a stale transport, skip the availability wait and continue directly to repair.
-2. **Recovery and stability:** after an outage is observed, probe until `WaitTimeoutSeconds` expires. If `StableForSeconds` is nonzero, require continuous success for that duration and reset the stability timer after any failed probe.
+2. **Recovery and stability:** after an outage is observed, probe until `WaitTimeoutSeconds` expires. If `StableForSeconds` is nonzero, query `[Environment]::TickCount64` through remote `pwsh` and require the current OS boot to be at least that old. Failed SSH probes do not reset any client-side timer; an actual reboot resets the remote uptime naturally.
 3. **Repair:** create a new session with the captured connection details and transplant it into the original session object.
 
 `SshConnectionTimeoutSeconds` controls the timeout used by each connectivity probe in both the shutdown-detection and recovery phases.
@@ -128,6 +132,7 @@ When changing connection or repair behavior, verify at least these scenarios man
 - a non-transport remote error, which must not retry;
 - no restart during the grace period;
 - a single restart; and
-- repeated availability changes during the stability window.
+- transient SSH failures while OS uptime continues increasing; and
+- another OS restart during the stability window, which resets remote uptime.
 
 The repository does not currently contain an automated test suite, so this list is the minimum regression baseline until tests are added.
